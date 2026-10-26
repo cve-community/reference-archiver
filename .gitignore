@@ -5,4 +5,14 @@ mount
 dist
 node_modules
 !/local/data/.gitkeep
-/local/data/
+/local/data/.terraform/
+*.tfstate*
+plan.out
+plan.json
+infra/archive/lambda.zip
+_site/
+.state/
+.operator.env
+.envrc
+.terraform/
+__pycache__/

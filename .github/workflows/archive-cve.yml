@@ -1,0 +1,395 @@
+name: Archive CVE References
+
+on:
+  workflow_dispatch:
+    inputs:
+      cve_id:
+        description: 'CVE ID to archive (e.g. CVE-2021-44228)'
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      cve_id:
+        description: 'CVE ID to archive (e.g. CVE-2021-44228)'
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  S3_BUCKET: ${{ vars.S3_BUCKET || 'archiver-demo-v1-public' }}
+  AWS_REGION: us-east-1
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.extract.outputs.matrix }}
+      has_refs: ${{ steps.extract.outputs.has_refs }}
+      ref_count: ${{ steps.extract.outputs.ref_count }}
+    steps:
+      - name: Fetch and extract CVE references
+        id: extract
+        run: |
+          set -euo pipefail
+
+          CVE_ID="${{ inputs.cve_id }}"
+
+          # Validate CVE ID format (must be CVE-YYYY-NNNNN, uppercase, 4+ digit suffix)
+          if [[ ! "$CVE_ID" =~ ^CVE-[0-9]{4}-[0-9]{4,}$ ]]; then
+            echo "::error::Invalid CVE ID format: '$CVE_ID'. Expected format: CVE-YYYY-NNNNN (e.g. CVE-2021-44228)" >&2
+            exit 1
+          fi
+
+          # Parse CVE ID components
+          YEAR=$(echo "$CVE_ID" | cut -d'-' -f2)
+          NUM=$(echo "$CVE_ID" | cut -d'-' -f3)
+
+          # Compute 1000-block path segment: e.g. 29002 → 29xxx, 44228 → 44xxx, 0001 → 0xxx
+          # Strip leading zeros from NUM for arithmetic, then integer-divide by 1000
+          NUM_INT=$(echo "$NUM" | sed 's/^0*//' | grep -E '^[0-9]+$' || echo "0")
+          BLOCK=$(( NUM_INT / 1000 ))
+          NUM_XXX="${BLOCK}xxx"
+
+          # Construct GitHub raw content URL
+          CVE_URL="https://raw.githubusercontent.com/CVEProject/cvelistV5/refs/heads/main/cves/${YEAR}/${NUM_XXX}/CVE-${YEAR}-${NUM}.json"
+          echo "Fetching: $CVE_URL" >&2
+
+          # Fetch CVE JSON from GitHub raw content (no auth required)
+          # --fail-with-body: exit non-zero on HTTP 4xx/5xx, include body in stderr
+          RESPONSE=$(curl --fail-with-body --silent --show-error "$CVE_URL")
+
+          # Extract reference URLs (null-safe — handles reserved/rejected CVEs where
+          # .containers.cna or .references may be absent)
+          URLS=$(echo "$RESPONSE" | jq -r '
+            (.containers.cna.references // [])
+            | .[].url
+          ' 2>/dev/null || true)
+
+          # Count non-empty lines
+          REF_COUNT=$(printf '%s' "$URLS" | grep -c . 2>/dev/null || echo "0")
+
+          # Empty reference guard: GHA treats fromJSON([]) as a workflow-level error.
+          # Must check count here and skip matrix output if zero — cannot be caught downstream.
+          if [ "$REF_COUNT" -eq 0 ]; then
+            echo "has_refs=false" >> "$GITHUB_OUTPUT"
+            echo "matrix=[]" >> "$GITHUB_OUTPUT"
+            echo "ref_count=0" >> "$GITHUB_OUTPUT"
+            {
+              echo "### ${CVE_ID}: No References Found"
+              echo ""
+              echo "This CVE has no reference URLs. Nothing to archive."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # Build fromJSON-compatible matrix: array of {index, url} objects.
+          # Index is embedded here (not derived from URL) to avoid artifact name collisions
+          # and because strategy.job-index is not reliably accessible inside matrix steps.
+          MATRIX=$(printf '%s' "$URLS" | jq -R -s '
+            split("\n")
+            | map(select(length > 0))
+            | to_entries
+            | map({"index": .key, "url": .value})
+          ' | jq -c '.')
+
+          echo "has_refs=true" >> "$GITHUB_OUTPUT"
+          echo "ref_count=${REF_COUNT}" >> "$GITHUB_OUTPUT"
+          echo "matrix=${MATRIX}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### ${CVE_ID}: ${REF_COUNT} reference(s) found"
+            echo ""
+            echo "Matrix prepared. Archiving will begin when downstream jobs are wired."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  archive:
+    runs-on: ubuntu-latest
+    needs: prepare
+    if: needs.prepare.outputs.has_refs == 'true'
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        ref: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: Prepare output directory
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/output"
+          chmod 777 "$GITHUB_WORKSPACE/output"
+
+      - name: Initialize ArchiveBox collection
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE/output:/data" \
+            archivebox/archivebox \
+            init --setup
+
+      - name: Archive URL with ArchiveBox
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE/output:/data" \
+            -e SAVE_TITLE=False \
+            -e SAVE_FAVICON=False \
+            -e SAVE_WGET=True \
+            -e SAVE_WARC=True \
+            -e SAVE_PDF=True \
+            -e SAVE_SCREENSHOT=True \
+            -e SAVE_DOM=False \
+            -e SAVE_SINGLEFILE=False \
+            -e SAVE_READABILITY=False \
+            -e SAVE_GIT=False \
+            -e SAVE_YTDLP=False \
+            -e SAVE_ARCHIVE_DOT_ORG=False \
+            archivebox/archivebox \
+            add --depth=0 "${{ matrix.ref.url }}"
+
+      - name: Locate snapshot and compress WARC
+        run: |
+          set -euo pipefail
+
+          # Fix permissions — Docker container writes as root
+          sudo chown -R $(id -u):$(id -g) "$GITHUB_WORKSPACE/output"
+
+          SNAPSHOT_DIR=$(find "$GITHUB_WORKSPACE/output/archive" \
+            -mindepth 1 -maxdepth 1 -type d | sort | tail -1)
+
+          if [ -z "$SNAPSHOT_DIR" ]; then
+            echo "::error::No snapshot directory found after ArchiveBox run" >&2
+            exit 1
+          fi
+
+          echo "Snapshot dir: $SNAPSHOT_DIR"
+          ls -la "$SNAPSHOT_DIR" >&2
+
+          # Compress WARC directory to tgz (ARCH-02)
+          if [ -d "${SNAPSHOT_DIR}/warc" ]; then
+            tar -czf "${SNAPSHOT_DIR}/warc.tgz" -C "${SNAPSHOT_DIR}" warc/
+            echo "WARC compressed: ${SNAPSHOT_DIR}/warc.tgz"
+          else
+            echo "::warning::No warc/ directory — SAVE_WGET/SAVE_WARC may not have produced WARC output"
+          fi
+
+          # Verify all three outputs exist
+          echo "Snapshot contents:" && ls -la "$SNAPSHOT_DIR" >&2
+          test -f "${SNAPSHOT_DIR}/output.pdf"      || { echo "::error::output.pdf not found" >&2; exit 1; }
+          test -f "${SNAPSHOT_DIR}/screenshot.png"  || { echo "::error::screenshot.png not found" >&2; exit 1; }
+          test -f "${SNAPSHOT_DIR}/warc.tgz"        || { echo "::error::warc.tgz not found" >&2; exit 1; }
+
+          echo "SNAPSHOT_DIR=${SNAPSHOT_DIR}" >> "$GITHUB_ENV"
+
+      - name: Upload archive artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.cve_id }}-ref-${{ matrix.ref.index }}
+          path: |
+            ${{ env.SNAPSHOT_DIR }}/output.pdf
+            ${{ env.SNAPSHOT_DIR }}/screenshot.png
+            ${{ env.SNAPSHOT_DIR }}/warc.tgz
+          if-no-files-found: error
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Upload to S3
+        if: env.SNAPSHOT_DIR != ''
+        run: |
+          set -euo pipefail
+
+          REF_URL="${{ matrix.ref.url }}"
+
+          # Parse URL into domain, path, query
+          DOMAIN=$(echo "$REF_URL" | sed -E 's|^https?://([^/?#]+).*|\1|')
+          URI_PATH=$(echo "$REF_URL" | sed -E 's|^https?://[^/]+((/[^?#]*)?).*|\2|' | sed 's|^/||; s|/$||')
+          QUERY=$(echo "$REF_URL" | grep -oP '\?\K[^#]*' || true)
+
+          # Build S3 key prefix: v2/<domain>/<path>
+          S3_PREFIX="v2/${DOMAIN}"
+          if [ -n "$URI_PATH" ]; then
+            S3_PREFIX="${S3_PREFIX}/${URI_PATH}"
+          fi
+
+          # Append query params URL-safe if present
+          if [ -n "$QUERY" ]; then
+            # Encode query params: replace unsafe chars but keep = and &
+            ENCODED_QUERY=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${QUERY}', safe='=&'))")
+            S3_PREFIX="${S3_PREFIX}__q__${ENCODED_QUERY}"
+          fi
+
+          # ISO 8601 UTC timestamp folder
+          TIMESTAMP=$(date -u +"%Y%m%d-%H%M%S")
+          S3_PREFIX="${S3_PREFIX}/${TIMESTAMP}"
+
+          echo "S3 prefix: s3://${S3_BUCKET}/${S3_PREFIX}" >&2
+
+          # Upload all three files
+          aws s3 cp "${SNAPSHOT_DIR}/output.pdf"     "s3://${S3_BUCKET}/${S3_PREFIX}/output.pdf"
+          aws s3 cp "${SNAPSHOT_DIR}/screenshot.png"  "s3://${S3_BUCKET}/${S3_PREFIX}/screenshot.png"
+          aws s3 cp "${SNAPSHOT_DIR}/warc.tgz"        "s3://${S3_BUCKET}/${S3_PREFIX}/warc.tgz"
+
+          echo "Uploaded 3 files to s3://${S3_BUCKET}/${S3_PREFIX}/" >&2
+
+  collect:
+    runs-on: ubuntu-latest
+    needs: archive
+    if: always()
+    steps:
+      - name: Download all reference artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ inputs.cve_id }}-ref-*
+          merge-multiple: true
+          path: collected/
+
+      - name: Bundle into per-CVE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cve-${{ inputs.cve_id }}-archives
+          path: collected/
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Configure AWS credentials
+        if: always()
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update CVE index in S3
+        if: always()
+        run: |
+          set -euo pipefail
+
+          CVE_ID="${{ inputs.cve_id }}"
+          INDEX_KEY="v2/index/${CVE_ID}.json"
+
+          # Build CVE index by fetching the CVE JSON for its reference URLs,
+          # then matching those URLs against what's actually in S3
+          python3 - <<'PYEOF'
+          import json, subprocess, os, urllib.parse, re
+
+          cve_id = os.environ.get('CVE_ID', '${{ inputs.cve_id }}')
+          bucket = os.environ.get('S3_BUCKET', 'archiver-demo-v1-public')
+
+          # Fetch the CVE JSON to get reference URLs
+          m = re.match(r'CVE-(\d{4})-(\d+)', cve_id)
+          if not m:
+              print(f"Invalid CVE ID: {cve_id}")
+              exit(0)
+          year, num = m.group(1), m.group(2)
+          num_int = int(num)
+          block = num_int // 1000
+          cve_url = f"https://raw.githubusercontent.com/CVEProject/cvelistV5/refs/heads/main/cves/{year}/{block}xxx/{cve_id}.json"
+
+          result = subprocess.run(['curl', '-sf', cve_url], capture_output=True, text=True)
+          if result.returncode != 0:
+              print(f"Could not fetch CVE JSON for {cve_id}")
+              exit(0)
+
+          cve_data = json.loads(result.stdout)
+          refs = [r['url'] for r in (cve_data.get('containers', {}).get('cna', {}).get('references', []))]
+          if not refs:
+              print(f"No references for {cve_id}")
+              exit(0)
+
+          # Download existing index
+          try:
+              subprocess.run(['aws', 's3', 'cp', f's3://{bucket}/v2/index/{cve_id}.json', '/tmp/cve_index.json'],
+                           capture_output=True, check=True)
+              idx = json.load(open('/tmp/cve_index.json'))
+          except:
+              idx = {'cve_id': cve_id, 'snapshots': []}
+
+          existing_prefixes = {s['s3_prefix'] for s in idx.get('snapshots', [])}
+
+          for url in refs:
+              try:
+                  parsed = urllib.parse.urlparse(url)
+              except:
+                  continue
+
+              domain = parsed.hostname or ''
+              path = parsed.path.strip('/')
+              query = parsed.query
+
+              s3_url_prefix = f"v2/{domain}"
+              if path:
+                  s3_url_prefix += f"/{path}"
+              if query:
+                  encoded_q = urllib.parse.quote(query, safe='=&')
+                  s3_url_prefix += f"__q__{encoded_q}"
+
+              # List S3 objects under this URL's prefix to find timestamps
+              ls_result = subprocess.run(
+                  ['aws', 's3', 'ls', f's3://{bucket}/{s3_url_prefix}/', '--recursive'],
+                  capture_output=True, text=True
+              )
+
+              seen_prefixes = set()
+              for line in ls_result.stdout.strip().split('\n'):
+                  if not line.strip():
+                      continue
+                  parts = line.split(None, 3)
+                  if len(parts) < 4:
+                      continue
+                  key = parts[3]
+                  key_parts = key.split('/')
+                  if len(key_parts) < 2:
+                      continue
+                  prefix = '/'.join(key_parts[:-1])
+                  timestamp = key_parts[-2]
+
+                  if prefix in existing_prefixes or prefix in seen_prefixes:
+                      continue
+                  seen_prefixes.add(prefix)
+
+                  # Collect all files for this snapshot
+                  files = set()
+                  for l2 in ls_result.stdout.strip().split('\n'):
+                      p2 = l2.split(None, 3)
+                      if len(p2) >= 4 and '/'.join(p2[3].split('/')[:-1]) == prefix:
+                          files.add(p2[3].split('/')[-1])
+
+                  idx.setdefault('snapshots', []).append({
+                      'url': url,
+                      'timestamp': timestamp,
+                      's3_prefix': prefix,
+                      'files': sorted(files)
+                  })
+
+          idx['snapshots'].sort(key=lambda x: x['timestamp'], reverse=True)
+          idx['last_updated'] = subprocess.check_output(['date', '-u', '+%Y%m%d-%H%M%S']).decode().strip()
+          idx['total_snapshots'] = len(idx['snapshots'])
+
+          json.dump(idx, open('/tmp/cve_index_updated.json', 'w'), indent=2)
+          print(f"{len(idx['snapshots'])} total snapshots for {cve_id}")
+
+          PYEOF
+
+          aws s3 cp /tmp/cve_index_updated.json "s3://${S3_BUCKET}/${INDEX_KEY}" \
+            --content-type application/json
+
+      - name: Write job summary
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p collected/
+
+          # Count archive files (exclude metadata txt files)
+          ARCHIVE_FILES=$(find collected/ -type f \( -name '*.pdf' -o -name '*.png' -o -name '*.tgz' \) 2>/dev/null | wc -l | tr -d ' ')
+          SUCCESSFUL_ARCHIVES=$(( ARCHIVE_FILES / 3 ))
+
+          {
+            echo "### ${{ inputs.cve_id }}: Archive Run Complete"
+            echo ""
+            echo "| Metric | Count |"
+            echo "|--------|-------|"
+            echo "| Archives succeeded | ${SUCCESSFUL_ARCHIVES} |"
+            echo "| Files collected | ${ARCHIVE_FILES} |"
+          } >> "$GITHUB_STEP_SUMMARY"

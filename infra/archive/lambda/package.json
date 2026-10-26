@@ -1,0 +1,8 @@
+{
+    "name": "lambda-edge-lister",
+    "version": "0.0.1",
+    "type": "module",
+    "scripts": {
+      "dev": "node --watch invoke.mjs"
+    }
+}
