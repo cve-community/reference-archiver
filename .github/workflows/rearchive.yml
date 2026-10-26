@@ -202,3 +202,30 @@ jobs:
             --content-type application/json
         env:
           CVE_LIST: ${{ needs.check-schedule.outputs.cve_list }}
+
+  # Second leg of the self-chaining loop (see crawl-cves.yml).
+  chain:
+    name: Chain next run
+    needs: [check-schedule, rearchive, update-schedule]
+    if: always() && vars.AUTO_CHAIN == 'true' && inputs.dry_run != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      CHECK_RESULT: ${{ needs.check-schedule.result }}
+      CVES_DUE: ${{ needs.check-schedule.outputs.cves_due }}
+    steps:
+      - name: Pace the loop
+        if: env.CHECK_RESULT != 'success'
+        run: |
+          echo "::warning::check-schedule ended with '$CHECK_RESULT'; backing off 15 min before chaining"
+          sleep 900
+
+      - name: Rebuild site
+        if: env.CVES_DUE != '0' && env.CHECK_RESULT == 'success'
+        run: gh workflow run site.yml --ref main -R "$GITHUB_REPOSITORY"
+
+      - name: Dispatch crawl
+        run: gh workflow run crawl-cves.yml --ref main -R "$GITHUB_REPOSITORY"

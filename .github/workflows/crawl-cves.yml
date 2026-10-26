@@ -400,3 +400,39 @@ jobs:
             --content-type application/json
         env:
           CVE_LIST: ${{ needs.crawl.outputs.cve_list }}
+
+  # Scheduled triggers never fire in this repo (it is a fork; see MIGRATION.md),
+  # so the pipeline drives itself: crawl -> rearchive -> crawl -> ... Each leg
+  # dispatches the next. Kill switch: set the repo variable AUTO_CHAIN to
+  # anything but "true". Restart by hand: gh workflow run crawl-cves.yml
+  chain:
+    name: Chain next run
+    needs: [crawl, archive, update-index]
+    if: always() && vars.AUTO_CHAIN == 'true' && inputs.dry_run != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      CRAWL_RESULT: ${{ needs.crawl.result }}
+      CVES_FOUND: ${{ needs.crawl.outputs.cves_found }}
+    steps:
+      - name: Pace the loop
+        run: |
+          # This job holds the cve-archiving concurrency group while it sleeps,
+          # so a sleep here is a real pause for the whole pipeline.
+          if [ "$CRAWL_RESULT" != "success" ]; then
+            echo "::warning::crawl job ended with '$CRAWL_RESULT'; backing off 15 min before chaining"
+            sleep 900
+          elif [ "${CVES_FOUND:-0}" = "0" ]; then
+            echo "Nothing new; idling 10 min before the next cycle"
+            sleep 600
+          fi
+
+      - name: Rebuild site
+        if: env.CVES_FOUND != '0' && env.CRAWL_RESULT == 'success'
+        run: gh workflow run site.yml --ref main -R "$GITHUB_REPOSITORY"
+
+      - name: Dispatch rearchive
+        run: gh workflow run rearchive.yml --ref main -R "$GITHUB_REPOSITORY"

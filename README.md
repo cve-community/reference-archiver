@@ -25,14 +25,16 @@ This is the GitHub Actions implementation of the [AWG Reference Archive PRD](doc
 
 | Workflow            | Trigger                  | Purpose                                                |
 | ------------------- | ------------------------ | ------------------------------------------------------ |
-| `crawl-cves.yml`    | hourly `:00`             | Walk new cvelistV5 commits, archive up to 15 CVEs/run  |
-| `rearchive.yml`     | hourly `:15`             | Re-archive on the 3/10/30/90-day schedule              |
-| `site.yml`          | hourly `:30`, site edits | Build site + stats from S3, deploy to GitHub Pages     |
+| `crawl-cves.yml`    | self-chained (see below) | Walk new cvelistV5 commits, archive up to 100 CVEs/run |
+| `rearchive.yml`     | after each crawl         | Re-archive on the 3/10/30/90-day schedule              |
+| `site.yml`          | after archiving, site edits | Build site + stats from S3, deploy to GitHub Pages  |
 | `archive-cve.yml`   | manual / `workflow_call` | Archive all refs for one CVE                           |
 | `batch-archive.yml` | manual                   | Archive a list of CVEs                                 |
 | `infra.yml`         | PR / push on `infra/`    | `tofu plan` on PR; guarded `apply` on main (approval)  |
 
 `crawl-cves` and `rearchive` share the `cve-archiving` concurrency group: they never overlap, so `schedule.json` has a single writer at a time.
+
+The `schedule:` triggers are still in the files but never fire in this repo (it is a fork; GitHub doesn't run schedules here). Instead each run's `chain` job dispatches the next one: crawl → rearchive → crawl. Set the repo variable `AUTO_CHAIN` to anything but `true` to stop the loop; `gh workflow run crawl-cves.yml` restarts it.
 
 ## Storage
 

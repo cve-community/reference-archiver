@@ -99,5 +99,6 @@ Apex DNS already points at GitHub Pages; no Route53 change expected.
 
 ## Known issues carried over
 
+- **Scheduled triggers never fire here.** The repo is a fork of `CVEProject/cve-ref-archival`; `push` and `workflow_dispatch` work, `schedule` has never produced a run (checked 2026-10-26 across five hourly slots, cron lines changed, all workflows `active`). Leaving the fork network would fix it but GitHub drops the fork's issues and PRs when you do. Instead the pipeline self-chains: crawl → rearchive → crawl (the `chain` job in each). Kill switch: repo variable `AUTO_CHAIN` ≠ `true`. If the loop ever stops, restart it with `gh workflow run crawl-cves.yml`.
 - Throughput: raised to 100 CVEs/run, 10 CVEs in parallel (2026-10-26). The free plan caps the org at 20 concurrent jobs, so that is roughly the ceiling.
 - `archivebox/archivebox` is pinned to 0.7.4 by digest (`archive-cve.yml`); 0.9.x changes the snapshot layout and needs a port before upgrading.
