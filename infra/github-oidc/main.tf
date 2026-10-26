@@ -32,7 +32,9 @@ data "aws_iam_openid_connect_provider" "github" {
 }
 
 locals {
-  repo         = "${var.github_org}/${var.github_repo}"
+  # The repo uses GitHub's immutable OIDC subject (owner@id/repo@id), which
+  # survives renames and can't be claimed by a recreated repo of the same name
+  repo         = "${var.github_org}@${var.github_org_id}/${var.github_repo}@${var.github_repo_id}"
   bucket_arn   = "arn:aws:s3:::${var.archive_bucket}"
   state_bucket = "arn:aws:s3:::${var.state_bucket}"
   lock_table   = "arn:aws:dynamodb:us-west-2:${data.aws_caller_identity.current.account_id}:table/${var.lock_table}"
