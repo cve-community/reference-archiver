@@ -10,7 +10,11 @@ Goal: this repo drives everything; the data in `s3://archiver-demo-v1-public` is
 - [x] §2 `infra/github-oidc` applied (2026-10-26)
 - [x] §4 infra adopted; versioning + noncurrent-only lifecycle live (2026-10-26)
 - [x] ECS pilot torn down (2026-10-26, see §7)
-- [ ] Steps below
+- [x] §3 repo settings (2026-10-26)
+- [x] §5 pipeline cutover (2026-10-26): crawl state in `v2/state/`; ArchiveBox pinned to 0.7.4 (archiving had been broken since 2026-09-23); 19,531 CVEs from 2026-09-22 → 2026-10-16 queued in `v2/state/backfill-cves.txt`
+- [x] §6 site cutover (2026-10-26): `cvearchiver.com` on this repo's Pages, refgha Pages unpublished, org verification TXT in `infra/archive/dns.tf`
+- [x] §7 decommission (2026-10-26): refgha's IAM key deactivated (not deleted), VulnCorps repo secrets deleted, `VulnCorps/refgha` and `VulnCorps/iac` archived
+- [ ] Later: delete the inactive `bootstrap` access key and, once nothing needs it, the `bootstrap` user
 
 ## 1. Pre-flight (read-only, admin creds)
 
