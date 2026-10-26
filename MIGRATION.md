@@ -83,6 +83,11 @@ Apex DNS already points at GitHub Pages; no Route53 change expected.
 - Deactivate (don't delete yet) the IAM access key behind refgha's `AWS_ACCESS_KEY_ID` secret; delete the repo secrets
 - Archive `VulnCorps/refgha` and `VulnCorps/iac`
 - [x] ECS pilot (`iac/aws/archiver/containers`) torn down by hand on 2026-10-26. It was crash-looping (its Supabase Postgres is gone) and was ~$50/mo of a ~$55/mo bill. Removed: service, cluster, task def, ALB + 6 public IPv4s, target group, SG `cve-archiver-sg`, IAM roles `ecsTaskExecutionRole`/`ecsTaskRole`, log group `/ecs/cve-archiver`, `api.cvearchiver.com` records + ACM cert. Secret `prod/archiver/settings` is scheduled for deletion (recoverable until 2026-11-25).
+- [x] Infra consolidated into this repo (2026-10-26); the VulnCorps repos own nothing and can be archived:
+  - `infra/bootstrap` (by hand): state bucket `vulncorps-tofu-s3-backend` + lock table, imported
+  - `infra/github-oidc` (by hand): now owns the account's GitHub OIDC provider (imported); old `github-oidc-deployer` role deleted and the old `github-oidc/terraform.tfstate` removed (bucket is versioned)
+  - `infra/archive` (CI): now owns the `cvearchiver.com` zone, apex A and `www` CNAME (`www` → `cve-community.github.io`)
+  - The old `containers` local state still lists the zone. Throw that state away; never apply it.
 - **Never `tofu destroy` either old iac stack:**
   - `containers` declares the `cvearchiver.com` Route53 zone as a resource (`aws_route53_zone.cvearchiver`); destroying it would take the zone with it. Its local state is now stale; delete it, don't apply it.
   - `iac/aws/oidc` owns the GitHub OIDC provider that this repo's roles trust. Its `github-oidc-deployer` role (ReadOnly, trusts `VulnCorps/iac`) can go; the provider can't.
