@@ -1,0 +1,379 @@
+name: Crawl CVE Updates
+
+on:
+  schedule:
+    - cron: '0 * * * *'  # Every hour
+  workflow_dispatch:
+    inputs:
+      max_commits:
+        description: 'Max commits to process (0 = unlimited)'
+        required: false
+        default: '100'
+        type: string
+      max_cves:
+        description: 'Max CVEs to archive per run (GHA 256 matrix limit)'
+        required: false
+        default: '15'
+        type: string
+      dry_run:
+        description: 'Dry run — log what would be archived but skip actual archival'
+        required: false
+        default: 'false'
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  S3_BUCKET: ${{ vars.S3_BUCKET || 'archiver-demo-v1-public' }}
+  AWS_REGION: us-east-1
+  # Crawl cursor + spillover queue live next to schedule.json. On first run
+  # (no state in S3) the crawl seeds from state-seed/, carried over from refgha.
+  STATE_PREFIX: v2/state
+
+concurrency:
+  group: cve-archiving
+  cancel-in-progress: false
+
+jobs:
+  crawl:
+    name: Crawl cvelistV5 commits
+    runs-on: ubuntu-latest
+    outputs:
+      cves_found: ${{ steps.crawl.outputs.cves_found }}
+      cve_list: ${{ steps.crawl.outputs.cve_list }}
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Load crawl state
+        run: |
+          set -euo pipefail
+          mkdir -p .state
+
+          # Only seed when the cursor is definitively absent. Any API error
+          # fails the run (set -e) rather than silently rewinding the cursor.
+          FOUND=$(aws s3api list-objects-v2 --bucket "$S3_BUCKET" \
+            --prefix "$STATE_PREFIX/last-processed-sha" --query 'KeyCount' --output text)
+          if [ "$FOUND" != "0" ]; then
+            aws s3 cp "s3://$S3_BUCKET/$STATE_PREFIX/last-processed-sha" .state/last-processed-sha
+            : > .state/spillover-cves.txt
+            SPILL=$(aws s3api list-objects-v2 --bucket "$S3_BUCKET" \
+              --prefix "$STATE_PREFIX/spillover-cves.txt" --query 'KeyCount' --output text)
+            if [ "$SPILL" != "0" ]; then
+              aws s3 cp "s3://$S3_BUCKET/$STATE_PREFIX/spillover-cves.txt" .state/spillover-cves.txt
+            fi
+            echo "Loaded crawl state from S3" >&2
+          else
+            cp state-seed/last-processed-sha state-seed/spillover-cves.txt .state/
+            echo "::notice::No crawl state in S3 — seeded from state-seed/" >&2
+          fi
+
+      - name: Crawl new commits for CVE references
+        id: crawl
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          MAX_COMMITS="${{ inputs.max_commits || '100' }}"
+          MAX_CVES="${{ inputs.max_cves || '15' }}"
+          DRY_RUN="${{ inputs.dry_run || 'false' }}"
+
+          # Count non-empty lines without the `grep -c || echo 0` double-print
+          count_lines() { grep -c . "$1" 2>/dev/null || true; }
+
+          # Read last processed SHA
+          LAST_SHA=$(tr -d '[:space:]' < .state/last-processed-sha)
+          echo "Last processed SHA: $LAST_SHA" >&2
+
+          # Carry spillover CVEs from the previous run into this run's queue
+          SPILLOVER_FILE=".state/spillover-cves.txt"
+          rm -f /tmp/cves_with_refs.txt
+          if [ -s "$SPILLOVER_FILE" ]; then
+            echo "Found $(count_lines "$SPILLOVER_FILE") spillover CVEs from previous run" >&2
+            cp "$SPILLOVER_FILE" /tmp/cves_with_refs.txt
+          fi
+
+          # Get commits since last SHA (newest first from API, we reverse later)
+          SINCE=$(gh api "repos/CVEProject/cvelistV5/commits/${LAST_SHA}" --jq '.commit.committer.date')
+          PAGE=1
+          : > /tmp/all_shas.txt
+          while true; do
+            gh api "repos/CVEProject/cvelistV5/commits?sha=main&since=${SINCE}&per_page=100&page=${PAGE}" \
+              --jq '.[].sha' > /tmp/batch.txt
+            [ -s /tmp/batch.txt ] || break
+            cat /tmp/batch.txt >> /tmp/all_shas.txt
+            [ "$(count_lines /tmp/batch.txt)" -lt 100 ] && break
+            PAGE=$((PAGE + 1))
+          done
+
+          # Reverse to chronological order, remove the last-processed SHA
+          tac /tmp/all_shas.txt | grep -v "^${LAST_SHA}$" > /tmp/commit_shas.txt || true
+
+          TOTAL=$(count_lines /tmp/commit_shas.txt)
+          echo "Found $TOTAL new commits since $LAST_SHA" >&2
+
+          # Apply max_commits limit
+          if [ "$MAX_COMMITS" != "0" ] && [ "$TOTAL" -gt "$MAX_COMMITS" ]; then
+            head -n "$MAX_COMMITS" /tmp/commit_shas.txt > /tmp/commit_shas_limited.txt
+            mv /tmp/commit_shas_limited.txt /tmp/commit_shas.txt
+            TOTAL="$MAX_COMMITS"
+            echo "Limiting to $MAX_COMMITS commits" >&2
+          fi
+
+          # Walk commits, collect CVE IDs that have references
+          LATEST_SHA="$LAST_SHA"
+          COMMITS_PROCESSED=0
+
+          while IFS= read -r SHA; do
+            [ -z "$SHA" ] && continue
+
+            # Get changed CVE files in this commit
+            FILES=$(gh api "repos/CVEProject/cvelistV5/commits/${SHA}" \
+              --jq '[.files[] | select(.filename | test("^cves/.*\\.json$")) | select(.filename | test("delta|deltaLog") | not) | .filename] | .[]' 2>/dev/null || true)
+
+            for FILE in $FILES; do
+              CVE_ID=$(basename "$FILE" .json)
+
+              # Fetch the CVE JSON and check if it has references
+              CVE_URL="https://raw.githubusercontent.com/CVEProject/cvelistV5/main/${FILE}"
+              REF_COUNT=$(curl -sf "$CVE_URL" | jq '[(.containers.cna.references // []) | .[].url] | length' 2>/dev/null || echo "0")
+
+              if [ "$REF_COUNT" -gt 0 ]; then
+                echo "$CVE_ID" >> /tmp/cves_with_refs.txt
+              fi
+            done
+
+            LATEST_SHA="$SHA"
+            COMMITS_PROCESSED=$((COMMITS_PROCESSED + 1))
+          done < /tmp/commit_shas.txt
+
+          # Deduplicate, then split into "archive now" (up to cap) and "spillover".
+          # File-based on purpose: `echo "$BIG" | head` dies with SIGPIPE under pipefail.
+          touch /tmp/cves_with_refs.txt
+          sort -u /tmp/cves_with_refs.txt | grep . > /tmp/all_unique.txt || true
+          head -n "$MAX_CVES" /tmp/all_unique.txt > /tmp/archive_now.txt
+          tail -n +"$((MAX_CVES + 1))" /tmp/all_unique.txt > "$SPILLOVER_FILE"
+
+          ALL_COUNT=$(count_lines /tmp/all_unique.txt)
+          CVE_COUNT=$(count_lines /tmp/archive_now.txt)
+          SPILLOVER_COUNT=$(count_lines "$SPILLOVER_FILE")
+          REMAINING=$((TOTAL - COMMITS_PROCESSED))
+          echo "Found $ALL_COUNT unique CVEs across $COMMITS_PROCESSED commits — archiving $CVE_COUNT, spilling $SPILLOVER_COUNT ($REMAINING commits remaining)" >&2
+
+          CVE_JSON=$(jq -R -s -c 'split("\n") | map(select(length > 0))' /tmp/archive_now.txt)
+
+          echo "cves_found=${CVE_COUNT}" >> "$GITHUB_OUTPUT"
+          echo "cve_list=${CVE_JSON}" >> "$GITHUB_OUTPUT"
+          echo "$LATEST_SHA" > .state/last-processed-sha
+
+          {
+            echo "### Crawl Results"
+            echo ""
+            echo "| Metric | Value |"
+            echo "|--------|-------|"
+            echo "| Commits processed | $COMMITS_PROCESSED / $TOTAL |"
+            echo "| Commits remaining | $REMAINING |"
+            echo "| CVEs to archive | $CVE_COUNT (cap: $MAX_CVES) |"
+            echo "| CVEs spilled to next run | $SPILLOVER_COUNT |"
+            echo "| Last SHA | \`${LATEST_SHA:0:12}\` |"
+            echo "| Dry run | $DRY_RUN |"
+            if [ "$CVE_COUNT" -gt 0 ]; then
+              echo ""
+              echo "**CVEs to archive:**"
+              sed 's/^/- /' /tmp/archive_now.txt
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Save crawl state
+        if: inputs.dry_run != 'true'
+        run: |
+          set -euo pipefail
+          aws s3 cp .state/last-processed-sha "s3://$S3_BUCKET/$STATE_PREFIX/last-processed-sha" --content-type text/plain
+          aws s3 cp .state/spillover-cves.txt "s3://$S3_BUCKET/$STATE_PREFIX/spillover-cves.txt" --content-type text/plain
+
+  archive:
+    name: Archive ${{ matrix.cve_id }}
+    needs: crawl
+    if: needs.crawl.outputs.cves_found != '0' && inputs.dry_run != 'true'
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        cve_id: ${{ fromJSON(needs.crawl.outputs.cve_list) }}
+    uses: ./.github/workflows/archive-cve.yml
+    with:
+      cve_id: ${{ matrix.cve_id }}
+    secrets: inherit
+
+  update-index:
+    name: Update S3 index
+    needs: [crawl, archive]
+    if: always() && needs.crawl.outputs.cves_found != '0' && inputs.dry_run != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Build and upload index
+        run: |
+          set -euo pipefail
+
+          # Download existing index (or start fresh)
+          aws s3 cp "s3://${S3_BUCKET}/v2/index.json" /tmp/index.json 2>/dev/null || echo '{}' > /tmp/index.json
+
+          # List all objects under v2/ to rebuild index from actual S3 state
+          aws s3 ls "s3://${S3_BUCKET}/v2/" --recursive \
+            | grep -E '(output\.pdf|screenshot\.png|warc\.tgz)$' \
+            | awk '{print $4}' > /tmp/s3_files.txt
+
+          # Parse S3 keys into index entries
+          # Key format: v2/<domain>/<path>[__q__<query>]/<timestamp>/<file>
+          python3 - <<'PYEOF'
+          import json, re, sys
+          from collections import defaultdict
+          from datetime import datetime, timezone
+          from urllib.parse import unquote
+
+          index = json.load(open('/tmp/index.json'))
+
+          # Group files by their parent path (everything before the filename)
+          snapshots = defaultdict(list)
+          with open('/tmp/s3_files.txt') as f:
+              for line in f:
+                  key = line.strip()
+                  if not key:
+                      continue
+                  parts = key.split('/')
+                  filename = parts[-1]
+                  timestamp = parts[-2]
+                  # Everything between v2/ and timestamp is the URL path
+                  url_parts = parts[1:-2]  # skip 'v2' prefix and timestamp/filename
+
+                  # Reconstruct the original URL from the S3 key
+                  domain = url_parts[0]
+                  path_parts = url_parts[1:]
+                  uri_path = '/'.join(path_parts)
+
+                  # Split on __q__ to separate path from query
+                  if '__q__' in uri_path:
+                      path_part, query_part = uri_path.rsplit('__q__', 1)
+                      original_url = f"https://{domain}/{path_part}?{query_part}"
+                  else:
+                      original_url = f"https://{domain}/{uri_path}"
+
+                  snapshot_key = f"{'/'.join(url_parts)}/{timestamp}"
+                  snapshots[snapshot_key].append({
+                      'file': filename,
+                      's3_key': key
+                  })
+
+          # Build CVE index by scanning for CVE IDs in the URL paths
+          # We need to map CVE → snapshots. Since URLs are reference URLs (not CVE-specific),
+          # we build a url → snapshots map
+          url_index = {}
+          for snapshot_key, files in snapshots.items():
+              parts = snapshot_key.split('/')
+              timestamp = parts[-1]
+              url_parts = parts[:-1]
+              domain = url_parts[0]
+              uri_path = '/'.join(url_parts[1:])
+
+              if '__q__' in uri_path:
+                  path_part, query_part = uri_path.rsplit('__q__', 1)
+                  original_url = f"https://{domain}/{path_part}?{query_part}"
+              else:
+                  original_url = f"https://{domain}/{uri_path}"
+
+              if original_url not in url_index:
+                  url_index[original_url] = []
+
+              url_index[original_url].append({
+                  'timestamp': timestamp,
+                  's3_prefix': f"v2/{'/'.join(url_parts)}/{timestamp}",
+                  'files': [f['file'] for f in files]
+              })
+
+          # Sort snapshots by timestamp (newest first)
+          for url in url_index:
+              url_index[url].sort(key=lambda x: x['timestamp'], reverse=True)
+
+          # Write the index
+          output = {
+              'generated': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+              'total_urls': len(url_index),
+              'total_snapshots': sum(len(v) for v in url_index.values()),
+              'urls': url_index
+          }
+
+          with open('/tmp/index_new.json', 'w') as f:
+              json.dump(output, f, indent=2)
+
+          print(f"Index: {len(url_index)} URLs, {sum(len(v) for v in url_index.values())} snapshots")
+          PYEOF
+
+          # Upload new index
+          aws s3 cp /tmp/index_new.json "s3://${S3_BUCKET}/v2/index.json" \
+            --content-type application/json
+
+          {
+            echo "### Index Updated"
+            echo ""
+            echo "$(python3 -c "import json; d=json.load(open('/tmp/index_new.json')); print(f'**{d[\"total_urls\"]}** URLs, **{d[\"total_snapshots\"]}** snapshots')")"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Register CVEs in re-archive schedule
+        run: |
+          set -euo pipefail
+
+          CVE_LIST='${{ needs.crawl.outputs.cve_list }}'
+
+          # Download existing schedule
+          aws s3 cp "s3://${S3_BUCKET}/v2/schedule.json" /tmp/schedule.json 2>/dev/null \
+            || echo '{"entries":[]}' > /tmp/schedule.json
+
+          # Add new CVEs to schedule (skip if already tracked)
+          python3 - <<'PYEOF'
+          import json, os
+          from datetime import datetime, timezone
+
+          now = datetime.now(timezone.utc)
+          cve_list = json.loads(os.environ.get('CVE_LIST', '[]'))
+          schedule = json.load(open('/tmp/schedule.json'))
+
+          existing = {e['cve_id'] for e in schedule.get('entries', [])}
+          added = 0
+
+          for cve_id in cve_list:
+              if cve_id in existing:
+                  continue
+              schedule.setdefault('entries', []).append({
+                  'cve_id': cve_id,
+                  'first_archived': now.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                  'completed_intervals': [0],  # 0 = initial archival
+                  'last_rearchived': now.strftime('%Y%m%d-%H%M%S'),
+              })
+              added += 1
+
+          schedule['entries'].sort(key=lambda e: e['cve_id'])
+          schedule['last_updated'] = now.strftime('%Y%m%d-%H%M%S')
+
+          json.dump(schedule, open('/tmp/schedule_updated.json', 'w'), indent=2)
+          print(f"Schedule: added {added} new CVEs ({len(schedule['entries'])} total)")
+          PYEOF
+
+          aws s3 cp /tmp/schedule_updated.json "s3://${S3_BUCKET}/v2/schedule.json" \
+            --content-type application/json
+        env:
+          CVE_LIST: ${{ needs.crawl.outputs.cve_list }}

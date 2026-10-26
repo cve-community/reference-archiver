@@ -1,0 +1,93 @@
+name: Infra
+
+on:
+  pull_request:
+    paths: ['infra/archive/**', 'scripts/infra-guard.sh', '.github/workflows/infra.yml']
+  push:
+    branches: [main]
+    paths: ['infra/archive/**', 'scripts/infra-guard.sh', '.github/workflows/infra.yml']
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  TOFU_VERSION: 1.10.6
+  WORKDIR: infra/archive
+
+concurrency:
+  group: infra
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: tofu plan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+          tofu_wrapper: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_INFRA_PLAN_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Plan
+        working-directory: ${{ env.WORKDIR }}
+        run: |
+          set -euo pipefail
+          tofu init -input=false
+          tofu plan -input=false -out=plan.out
+          tofu show -json plan.out > plan.json
+          {
+            echo '### tofu plan'
+            echo '```'
+            tofu show -no-color plan.out | tail -n 200
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Guard archive data
+        run: scripts/infra-guard.sh "$WORKDIR/plan.json"
+
+  apply:
+    name: tofu apply
+    needs: plan
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    # Required reviewers are configured on this environment in repo settings
+    environment: infra
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+          tofu_wrapper: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_INFRA_APPLY_ROLE_ARN }}
+          aws-region: us-east-1
+
+      # Re-plan under the apply role and re-guard; apply exactly that plan
+      - name: Plan
+        working-directory: ${{ env.WORKDIR }}
+        run: |
+          set -euo pipefail
+          tofu init -input=false
+          tofu plan -input=false -out=plan.out
+          tofu show -json plan.out > plan.json
+
+      - name: Guard archive data
+        run: scripts/infra-guard.sh "$WORKDIR/plan.json"
+
+      - name: Apply
+        working-directory: ${{ env.WORKDIR }}
+        run: tofu apply -input=false plan.out

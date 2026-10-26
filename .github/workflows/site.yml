@@ -1,0 +1,84 @@
+name: Build and Deploy Site
+
+on:
+  schedule:
+    - cron: '30 * * * *'  # Every hour at :30 (offset from crawl at :00)
+  push:
+    branches: [main]
+    paths: ['site/**', 'scripts/generate-*.py', '.github/workflows/site.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+  pages: write
+
+env:
+  S3_BUCKET: ${{ vars.S3_BUCKET || 'archiver-demo-v1-public' }}
+  AWS_REGION: us-east-1
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Generate site from S3
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: List S3 objects
+        run: |
+          aws s3 ls "s3://${S3_BUCKET}/v2/" --recursive > /tmp/s3-listing.txt
+          echo "S3 objects: $(wc -l < /tmp/s3-listing.txt)"
+
+      - name: Download CVE index files
+        run: |
+          mkdir -p /tmp/cve-indexes
+          aws s3 sync "s3://${S3_BUCKET}/v2/index/" /tmp/cve-indexes/ --exclude "*" --include "CVE-*.json"
+          echo "CVE indexes: $(ls /tmp/cve-indexes/*.json 2>/dev/null | wc -l)"
+
+      - name: Generate site data and stats
+        run: |
+          set -euo pipefail
+          mkdir -p _site
+          cp -R site/. _site/
+          python3 scripts/generate-site-data.py _site /tmp/cve-indexes /tmp/s3-listing.txt
+          STATS_OUTPUT=_site/stats.html python3 scripts/generate-stats.py
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Summary
+        run: |
+          python3 - <<'PYEOF' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          m = json.load(open('_site/data/manifest.json'))
+          print('### Site Generated\n')
+          print('| Metric | Value |')
+          print('|--------|-------|')
+          for k in ('total_domains', 'total_urls', 'total_snapshots', 'total_cves', 'generated'):
+              print(f'| {k} | {m.get(k)} |')
+          PYEOF
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4

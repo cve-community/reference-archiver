@@ -1,103 +1,79 @@
 # CVE Program Reference Archiver
 
-## Summary
+Monitors [CVEProject/cvelistV5](https://github.com/CVEProject/cvelistV5) for new and updated CVEs, archives every reference URL with ArchiveBox (PDF + screenshot + WARC) to S3, and serves a static browse/search UI.
 
-This is a pilot program exploring how to archive URL references found in CVE Records.  
-**Note:** This repository is in early development and is subject to change.
+**Browse:** [cvearchiver.com](https://cvearchiver.com) · **Stats:** [cvearchiver.com/stats.html](https://cvearchiver.com/stats.html) · **Raw archive:** [archive.cvearchiver.com](https://archive.cvearchiver.com)
 
-## Status: Review Required
+Everything runs on GitHub Actions + S3. No servers, no database.
 
-We are transitioning from **Phase 1** to **Phase 2** and would appreciate feedback.
+This is the GitHub Actions implementation of the [AWG Reference Archive PRD](docs/prd_20250919.md). The original Node/ECS pilot (`src/`, `deploy/`, `docker/`) is still in the tree, unchanged; see [docs/pilot-node.md](docs/pilot-node.md).
 
-### Open Tasks
-- [ ] Prepare the live environment.
-- [ ] Pilot in the live environment (target: ~2025-07-10).
-- [ ] Refactor and simplify code (currently fragmented across iterations).
-- [ ] Report findings to AWG/QWG.
+## PRD coverage
 
-### Known (Out of Scope)
-1. **Authentication**
-   - This project runs in an isolated environment. API access is only available via SSH to trusted users.
-2. **Process & Controls**
-   - Archiving is manual and initiated by trusted users. Deletion or modification of archived assets is not currently supported.
+| PRD   | Requirement                                   | Status |
+| ----- | --------------------------------------------- | ------ |
+| 2.1   | Archive every reference in a CVE record       | CNA container only; ADP references not yet |
+| 2.2   | PNG + PDF + WARC                              | Done |
+| 2.3   | Public retrieval by CVE ID + interval, as ZIP | Browse by CVE/domain on the site; per-file via archive.cvearchiver.com; no ZIP or interval selector yet |
+| 2.4   | 0/3/10/30/90-day intervals                    | Done (`rearchive.yml`, `schedule.json`) |
+| 3.1–3.4 | Scalable, simple, low-maintenance, cheap    | GHA + S3 only; throughput tuning pending (see MIGRATION.md) |
+| 3.5   | Documented removal procedure                  | [docs/removal.md](docs/removal.md) |
+| 5.1   | Don't archive 404s                            | Not yet |
+| 5.5   | Content size limits                           | Not yet |
 
----
+## Workflows
 
-## Project Overview
+| Workflow            | Trigger                  | Purpose                                                |
+| ------------------- | ------------------------ | ------------------------------------------------------ |
+| `crawl-cves.yml`    | hourly `:00`             | Walk new cvelistV5 commits, archive up to 15 CVEs/run  |
+| `rearchive.yml`     | hourly `:15`             | Re-archive on the 3/10/30/90-day schedule              |
+| `site.yml`          | hourly `:30`, site edits | Build site + stats from S3, deploy to GitHub Pages     |
+| `archive-cve.yml`   | manual / `workflow_call` | Archive all refs for one CVE                           |
+| `batch-archive.yml` | manual                   | Archive a list of CVEs                                 |
+| `infra.yml`         | PR / push on `infra/`    | `tofu plan` on PR; guarded `apply` on main (approval)  |
 
-The archiver includes:
-- **Two Node.js services:**
-  1. `scheduler` — Fastify-based HTTP API that queues archive jobs.
-  2. `engine` — Executes archive jobs and manages asset relocation.
-- **Infrastructure components:**
-  1. [`Amazon S3`](link_here) — For storing and delivering archived resources.
-  2. [`PostgreSQL`](link_here) — Tracks jobs, assets, and source domains.
-- **Development stack:**
-  1. [`Visual Studio Code`](https://code.visualstudio.com/) with DevContainers.
-  2. [`Docker Desktop`](https://www.docker.com/products/docker-desktop) for local environments, including:
-     - [`MinIO`](https://min.io/) (S3-compatible object storage).
-     - [`PostgreSQL`](https://www.postgresql.org/) database.
+`crawl-cves` and `rearchive` share the `cve-archiving` concurrency group: they never overlap, so `schedule.json` has a single writer at a time.
 
----
+## Storage
 
-## Documentation
+```
+s3://archiver-demo-v1-public/v2/
+├── <domain>/<path>[__q__<query>]/<YYYYMMDD-HHMMSS>/{output.pdf,screenshot.png,warc.tgz}
+├── index/<CVE-ID>.json     # per-CVE reference list + snapshot prefixes
+├── index.json              # global URL index (rebuilt from listing)
+├── schedule.json           # re-archive ledger
+└── state/                  # crawl cursor + spillover queue
+    ├── last-processed-sha
+    └── spillover-cves.txt
+```
 
-- General documentation: [`docs/`](docs/)
-- Rationale and background: [`docs/rationale.md`](docs/rationale.md#background--reference-materials)
+The bucket is the only irreplaceable thing here. Protections:
 
----
+- `prevent_destroy` on the bucket; versioning on, noncurrent versions kept 30 days
+- `scripts/infra-guard.sh` fails any plan that deletes/replaces an `aws_s3_*` resource or expires current objects
+- No CI role has `s3:DeleteObject`, `s3:DeleteObjectVersion` or `s3:DeleteBucket` (explicit deny)
 
-## Launch Strategy
+## Layout
 
-### Phase 1: Prototype
-- Set up a local, isolated foundation (database, S3).
-- Use ArchiveBox to generate archives and metadata.
-- Upload to a public S3 bucket.
-- Establish basic workflows for submitting CVEs and reviewing operations.
+```
+.github/workflows/   pipeline + infra CI
+scripts/             site/stats generators, index rebuild, infra guard
+site/                static SPA (data/ and stats.html generated at deploy)
+state-seed/          crawl cursor carried over from VulnCorps/refgha; used only if S3 state is absent
+infra/archive/       bucket, CloudFront + Lambda@Edge dirlist, DNS/ACM (CI-applied)
+infra/github-oidc/   OIDC roles for this repo (applied by hand by an admin)
+docs/                PRD, requirements, removal procedure, pilot docs
+src/ deploy/ docker/ Node/ECS pilot (upstream, inactive)
+```
 
-### Phase 2: Pilot
-- Deploy to a shared but isolated environment.
-- Provide access to stakeholders as needed (no public access).
-- Simulate job submissions over time with test plans.
-- Evaluate results and iterate.
+## Auth
 
-### Phase 3: TBD
-_Reserved._
+GitHub OIDC only, no static keys. Repo variables:
 
----
+| Variable                   | Role                            | Used by                         |
+| -------------------------- | ------------------------------- | ------------------------------- |
+| `AWS_ROLE_ARN`             | `reference-archiver-runtime`    | pipeline (main only)            |
+| `AWS_INFRA_PLAN_ROLE_ARN`  | `reference-archiver-infra-plan` | `infra.yml` plan (read-only)    |
+| `AWS_INFRA_APPLY_ROLE_ARN` | `reference-archiver-infra-apply`| `infra.yml` apply (`infra` env) |
 
-## Development
-
-**Contributions welcome!**  
-See [`docs/overview.md`](docs/overview.md) to get started.
-
-Development is containerized via [DevContainers](https://code.visualstudio.com/docs/devcontainers/containers) to ensure a consistent environment. Recommended setup:
-- VSCode + DevContainer plugin
-- Docker Desktop
-
----
-
-## Running Locally
-
-1. Clone and open in VSCode.
-2. Open the Command Palette (`Ctrl/Cmd + P`) and run:  
-   `> Dev Containers: Rebuild and Reopen in Container`
-   - This will reopen the project inside the container environment.
-   - Let the `Configuring...` terminal run; it watches and rebuilds on changes.
-3. Use the integrated terminal:
-   - Run both services: `npm run dev`
-   - Run individually: `npm run dev:scheduler` or `npm run dev:engine`
-
-<img src="docs/img/dev-loaded.png">
-
----
-
-## What to Expect
-
-Once running:
-
-1. **Submit a job:**
-   ```bash
-   curl --location 'http://localhost:8001/api/v1/jobs' \
-     --header 'Content-Type: application/json' \
-     --data '{ "cve": "CVE-2025-24070" }'
+See [MIGRATION.md](MIGRATION.md) for the cutover from `VulnCorps/refgha` + `VulnCorps/iac`.
