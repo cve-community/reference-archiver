@@ -21,6 +21,9 @@ permissions:
 env:
   S3_BUCKET: ${{ vars.S3_BUCKET || 'archiver-demo-v1-public' }}
   AWS_REGION: us-east-1
+  # Pinned: 0.9.x changed the snapshot layout (archive/users/system/snapshots/...)
+  # and broke every archive job from 2026-09-23 on. Bump deliberately.
+  ARCHIVEBOX_IMAGE: archivebox/archivebox:0.7.4@sha256:1a5a37331091d9df865ead2b9c231aa5a892fc26fe0422ce6140d9e2d9532327
 
 jobs:
   prepare:
@@ -124,7 +127,7 @@ jobs:
         run: |
           docker run --rm \
             -v "$GITHUB_WORKSPACE/output:/data" \
-            archivebox/archivebox \
+            "$ARCHIVEBOX_IMAGE" \
             init --setup
 
       - name: Archive URL with ArchiveBox
@@ -143,7 +146,7 @@ jobs:
             -e SAVE_GIT=False \
             -e SAVE_YTDLP=False \
             -e SAVE_ARCHIVE_DOT_ORG=False \
-            archivebox/archivebox \
+            "$ARCHIVEBOX_IMAGE" \
             add --depth=0 "${{ matrix.ref.url }}"
 
       - name: Locate snapshot and compress WARC

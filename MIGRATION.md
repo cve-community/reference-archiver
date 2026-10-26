@@ -91,4 +91,4 @@ Apex DNS already points at GitHub Pages; no Route53 change expected.
 ## Known issues carried over
 
 - Throughput: 15 CVEs/hr vs cvelistV5 churn; spillover will grow. Tune `max_cves` / matrix `max-parallel` after cutover.
-- `archivebox/archivebox` is unpinned (`latest`).
+- `archivebox/archivebox` is pinned to 0.7.4 by digest (`archive-cve.yml`); 0.9.x changes the snapshot layout and needs a port before upgrading.
