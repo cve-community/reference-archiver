@@ -8,6 +8,8 @@ Goal: this repo drives everything; the data in `s3://archiver-demo-v1-public` is
 - [x] §1 pre-flight (2026-10-26): no versioning, lifecycle or object lock; 463,624 objects / ~402 GB in `v2/`
 - [x] ECS `cve-archiver-service` scaled to 0 (2026-10-26)
 - [x] §2 `infra/github-oidc` applied (2026-10-26)
+- [x] §4 infra adopted; versioning + noncurrent-only lifecycle live (2026-10-26)
+- [x] ECS pilot torn down (2026-10-26, see §7)
 - [ ] Steps below
 
 ## 1. Pre-flight (read-only, admin creds)
@@ -80,7 +82,11 @@ Apex DNS already points at GitHub Pages; no Route53 change expected.
 
 - Deactivate (don't delete yet) the IAM access key behind refgha's `AWS_ACCESS_KEY_ID` secret; delete the repo secrets
 - Archive `VulnCorps/refgha` and `VulnCorps/iac`
-- ECS stack (`iac/aws/archiver/containers`, local state): `tofu destroy` from wherever that state lives. It only references the bucket by name in env vars; it does not manage it.
+- [x] ECS pilot (`iac/aws/archiver/containers`) torn down by hand on 2026-10-26. It was crash-looping (its Supabase Postgres is gone) and was ~$50/mo of a ~$55/mo bill. Removed: service, cluster, task def, ALB + 6 public IPv4s, target group, SG `cve-archiver-sg`, IAM roles `ecsTaskExecutionRole`/`ecsTaskRole`, log group `/ecs/cve-archiver`, `api.cvearchiver.com` records + ACM cert. Secret `prod/archiver/settings` is scheduled for deletion (recoverable until 2026-11-25).
+- **Never `tofu destroy` either old iac stack:**
+  - `containers` declares the `cvearchiver.com` Route53 zone as a resource (`aws_route53_zone.cvearchiver`); destroying it would take the zone with it. Its local state is now stale; delete it, don't apply it.
+  - `iac/aws/oidc` owns the GitHub OIDC provider that this repo's roles trust. Its `github-oidc-deployer` role (ReadOnly, trusts `VulnCorps/iac`) can go; the provider can't.
+- Lambda@Edge log groups (`/aws/lambda/us-east-1.archiver-dirlist`, `/aws/cloudfront/LambdaEdge/*`) set to 30-day retention in every region by hand; they're created per edge region, outside tofu.
 
 ## Known issues carried over
 
