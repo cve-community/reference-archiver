@@ -13,7 +13,7 @@ on:
       max_cves:
         description: 'Max CVEs to archive per run (GHA 256 matrix limit)'
         required: false
-        default: '15'
+        default: '100'
         type: string
       dry_run:
         description: 'Dry run — log what would be archived but skip actual archival'
@@ -85,7 +85,7 @@ jobs:
           set -euo pipefail
 
           MAX_COMMITS="${{ inputs.max_commits || '100' }}"
-          MAX_CVES="${{ inputs.max_cves || '15' }}"
+          MAX_CVES="${{ inputs.max_cves || '100' }}"
           DRY_RUN="${{ inputs.dry_run || 'false' }}"
 
           # Count non-empty lines without the `grep -c || echo 0` double-print
@@ -207,7 +207,8 @@ jobs:
     if: needs.crawl.outputs.cves_found != '0' && inputs.dry_run != 'true'
     strategy:
       fail-fast: false
-      max-parallel: 5
+      # Free plan: 20 concurrent jobs per org; each CVE fans out per reference
+      max-parallel: 10
       matrix:
         cve_id: ${{ fromJSON(needs.crawl.outputs.cve_list) }}
     uses: ./.github/workflows/archive-cve.yml
