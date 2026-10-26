@@ -1,0 +1,4 @@
+[tools]
+actionlint = "latest"
+aws-cli = { version = "2", symlink_bins = "true" }
+opentofu = "1.10"

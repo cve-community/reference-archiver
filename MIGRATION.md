@@ -5,6 +5,9 @@ Goal: this repo drives everything; the data in `s3://archiver-demo-v1-public` is
 ## Status
 
 - [x] refgha cron triggers removed (`VulnCorps/refgha@e32fa218`). `workflow_dispatch` still works there; don't use it after cutover.
+- [x] §1 pre-flight (2026-10-26): no versioning, lifecycle or object lock; 463,624 objects / ~402 GB in `v2/`
+- [x] ECS `cve-archiver-service` scaled to 0 (2026-10-26)
+- [x] §2 `infra/github-oidc` applied (2026-10-26)
 - [ ] Steps below
 
 ## 1. Pre-flight (read-only, admin creds)
@@ -15,12 +18,12 @@ aws s3api get-bucket-versioning           --bucket $B   # expect empty = never e
 aws s3api get-bucket-lifecycle-configuration --bucket $B   # if any rules exist, STOP: tofu would replace them
 aws s3api get-object-lock-configuration   --bucket $B
 aws s3 ls s3://$B/v2/ --recursive --summarize | tail -2     # object count + size, for the record
-aws ecs describe-services --cluster cve-archiver-cluster --services cve-archiver \
+aws ecs describe-services --cluster cve-archiver-cluster --services cve-archiver-service \
   --query 'services[].{status:status,desired:desiredCount,running:runningCount}'
 ```
 
 If the ECS `cve-archiver` service is running it also writes to this bucket. Scale it to 0 (don't destroy yet):
-`aws ecs update-service --cluster cve-archiver-cluster --service cve-archiver --desired-count 0`
+`aws ecs update-service --cluster cve-archiver-cluster --service cve-archiver-service --desired-count 0`
 
 Optional belt-and-braces before the first apply: a one-time copy of `v2/` to a separate bucket (cost ≈ storage size).
 
@@ -50,7 +53,8 @@ Dispatch `infra.yml` (or open a PR touching `infra/archive`). Expected plan, and
 - `+ aws_s3_bucket_versioning.archive`
 - `+ aws_s3_bucket_lifecycle_configuration.archive` (noncurrent versions only)
 - `null_resource.patch_lambda` removed from state (no API call)
-- possibly `~ aws_lambda_function.dirlist` + `~ aws_cloudfront_distribution.cdn` if the zip hash differs (republishes the same code)
+
+Lambda code and the `origin-request` trigger match what's deployed (live drifted from `VulnCorps/iac` git on 2026-05-05; this repo adopts the live version), so no Lambda/CloudFront change is expected.
 
 Anything else → stop and investigate. Approve the `infra` environment to apply.
 

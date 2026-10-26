@@ -10,6 +10,9 @@ data "archive_file" "lambda_zip" {
 # Was a no-op local-exec in the old stack; forget it without touching anything
 removed {
   from = null_resource.patch_lambda
+  lifecycle {
+    destroy = false
+  }
 }
 
 resource "aws_iam_role" "lambda_edge_role" {
@@ -103,7 +106,7 @@ resource "aws_cloudfront_distribution" "cdn" {
     cached_methods         = ["GET", "HEAD"]
 
     lambda_function_association {
-      event_type   = "viewer-request"
+      event_type   = "origin-request"
       lambda_arn   = aws_lambda_function.dirlist.qualified_arn
       include_body = false
     }

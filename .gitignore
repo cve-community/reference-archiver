@@ -12,3 +12,7 @@ plan.json
 infra/archive/lambda.zip
 _site/
 .state/
+.operator.env
+.envrc
+.terraform/
+__pycache__/
