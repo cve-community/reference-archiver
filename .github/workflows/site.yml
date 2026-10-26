@@ -2,7 +2,7 @@ name: Build and Deploy Site
 
 on:
   schedule:
-    - cron: '0 * * * *'  # Hourly, 30 min after the crawl
+    - cron: '5 * * * *'  # Hourly, 35 min after the crawl, off the top of the hour
   push:
     branches: [main]
     paths: ['site/**', 'scripts/generate-*.py', '.github/workflows/site.yml']
