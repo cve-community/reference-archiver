@@ -77,6 +77,15 @@ jobs:
             echo "::notice::No crawl state in S3 — seeded from state-seed/" >&2
           fi
 
+          # Low-priority backfill queue: only drained with capacity left over
+          # after new + spillover CVEs. Absent is fine (nothing to backfill).
+          : > .state/backfill-cves.txt
+          BACKFILL=$(aws s3api list-objects-v2 --bucket "$S3_BUCKET" \
+            --prefix "$STATE_PREFIX/backfill-cves.txt" --max-keys 1 --no-paginate --query 'length(Contents || `[]`)' --output text)
+          if [ "$BACKFILL" != "0" ]; then
+            aws s3 cp "s3://$S3_BUCKET/$STATE_PREFIX/backfill-cves.txt" .state/backfill-cves.txt
+          fi
+
       - name: Crawl new commits for CVE references
         id: crawl
         env:
@@ -159,10 +168,21 @@ jobs:
 
           # Deduplicate, then split into "archive now" (up to cap) and "spillover".
           # File-based on purpose: `echo "$BIG" | head` dies with SIGPIPE under pipefail.
+          # Newest CVE IDs first (year, then number, descending).
           touch /tmp/cves_with_refs.txt
-          sort -u /tmp/cves_with_refs.txt | grep . > /tmp/all_unique.txt || true
+          grep . /tmp/cves_with_refs.txt | sort -u | sort -t- -k2,2nr -k3,3nr > /tmp/all_unique.txt || true
           head -n "$MAX_CVES" /tmp/all_unique.txt > /tmp/archive_now.txt
           tail -n +"$((MAX_CVES + 1))" /tmp/all_unique.txt > "$SPILLOVER_FILE"
+
+          # Fill any spare capacity from the backfill queue
+          BACKFILL_FILE=".state/backfill-cves.txt"
+          SPARE=$((MAX_CVES - $(count_lines /tmp/archive_now.txt)))
+          if [ "$SPARE" -gt 0 ] && [ -s "$BACKFILL_FILE" ]; then
+            grep -vxF -f /tmp/archive_now.txt "$BACKFILL_FILE" > /tmp/backfill_rest.txt || true
+            head -n "$SPARE" /tmp/backfill_rest.txt >> /tmp/archive_now.txt
+            tail -n +"$((SPARE + 1))" /tmp/backfill_rest.txt > "$BACKFILL_FILE"
+          fi
+          echo "Backfill queue: $(count_lines "$BACKFILL_FILE") remaining" >&2
 
           ALL_COUNT=$(count_lines /tmp/all_unique.txt)
           CVE_COUNT=$(count_lines /tmp/archive_now.txt)
@@ -200,6 +220,7 @@ jobs:
           set -euo pipefail
           aws s3 cp .state/last-processed-sha "s3://$S3_BUCKET/$STATE_PREFIX/last-processed-sha" --content-type text/plain
           aws s3 cp .state/spillover-cves.txt "s3://$S3_BUCKET/$STATE_PREFIX/spillover-cves.txt" --content-type text/plain
+          aws s3 cp .state/backfill-cves.txt "s3://$S3_BUCKET/$STATE_PREFIX/backfill-cves.txt" --content-type text/plain
 
   archive:
     name: Archive ${{ matrix.cve_id }}
