@@ -82,3 +82,13 @@ resource "aws_acm_certificate_validation" "archive_cert_validation" {
   validation_record_fqdns = [for r in aws_route53_record.archive_cert_validation : r.fqdn]
 }
 
+
+# Verifies cvearchiver.com for the cve-community org's GitHub Pages (blocks
+# takeover by other accounts). Value from org Settings → Pages → Verified domains.
+resource "aws_route53_record" "github_pages_challenge" {
+  zone_id = aws_route53_zone.main.zone_id
+  name    = "_github-pages-challenge-cve-community.cvearchiver.com"
+  type    = "TXT"
+  ttl     = 300
+  records = ["97c763a44300e323f92fdaedf8c30a"]
+}
