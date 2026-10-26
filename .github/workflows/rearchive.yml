@@ -2,7 +2,7 @@ name: Re-archive Scheduled References
 
 on:
   schedule:
-    - cron: '15 * * * *'  # Every hour at :15
+    - cron: '45 * * * *'  # Hourly, 15 min after the crawl
   workflow_dispatch:
     inputs:
       dry_run:

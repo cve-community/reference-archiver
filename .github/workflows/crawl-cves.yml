@@ -2,7 +2,7 @@ name: Crawl CVE Updates
 
 on:
   schedule:
-    - cron: '0 * * * *'  # Every hour
+    - cron: '30 * * * *'  # Hourly, off the top of the hour (GitHub delays/drops :00 runs under load)
   workflow_dispatch:
     inputs:
       max_commits:
