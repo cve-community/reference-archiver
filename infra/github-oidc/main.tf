@@ -26,9 +26,21 @@ provider "aws" {
 
 data "aws_caller_identity" "current" {}
 
-# Account-wide provider, created and owned by the iac/aws/oidc stack
-data "aws_iam_openid_connect_provider" "github" {
-  url = "https://token.actions.githubusercontent.com"
+# Account-wide GitHub OIDC provider. Adopted on 2026-10-26 from the
+# VulnCorps/iac/aws/oidc stack, which no longer manages it.
+import {
+  to = aws_iam_openid_connect_provider.github
+  id = "arn:aws:iam::741458575106:oidc-provider/token.actions.githubusercontent.com"
+}
+
+resource "aws_iam_openid_connect_provider" "github" {
+  url             = "https://token.actions.githubusercontent.com"
+  client_id_list  = ["sts.amazonaws.com"]
+  thumbprint_list = ["6938fd4d98bab03faadb97b34396831e3780aea1"]
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 locals {
@@ -56,7 +68,7 @@ data "aws_iam_policy_document" "trust" {
     actions = ["sts:AssumeRoleWithWebIdentity"]
     principals {
       type        = "Federated"
-      identifiers = [data.aws_iam_openid_connect_provider.github.arn]
+      identifiers = [aws_iam_openid_connect_provider.github.arn]
     }
     condition {
       test     = "StringEquals"
@@ -89,7 +101,7 @@ data "aws_iam_policy_document" "data_protection" {
     sid       = "DenySelfEscalation"
     effect    = "Deny"
     actions   = ["iam:*"]
-    resources = ["${local.role_prefix}*", data.aws_iam_openid_connect_provider.github.arn]
+    resources = ["${local.role_prefix}*", aws_iam_openid_connect_provider.github.arn]
   }
 }
 
