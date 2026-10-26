@@ -60,13 +60,14 @@ jobs:
 
           # Only seed when the cursor is definitively absent. Any API error
           # fails the run (set -e) rather than silently rewinding the cursor.
+          # (KeyCount prints "None" for an empty listing, so count Contents.)
           FOUND=$(aws s3api list-objects-v2 --bucket "$S3_BUCKET" \
-            --prefix "$STATE_PREFIX/last-processed-sha" --query 'KeyCount' --output text)
+            --prefix "$STATE_PREFIX/last-processed-sha" --max-keys 1 --no-paginate --query 'length(Contents || `[]`)' --output text)
           if [ "$FOUND" != "0" ]; then
             aws s3 cp "s3://$S3_BUCKET/$STATE_PREFIX/last-processed-sha" .state/last-processed-sha
             : > .state/spillover-cves.txt
             SPILL=$(aws s3api list-objects-v2 --bucket "$S3_BUCKET" \
-              --prefix "$STATE_PREFIX/spillover-cves.txt" --query 'KeyCount' --output text)
+              --prefix "$STATE_PREFIX/spillover-cves.txt" --max-keys 1 --no-paginate --query 'length(Contents || `[]`)' --output text)
             if [ "$SPILL" != "0" ]; then
               aws s3 cp "s3://$S3_BUCKET/$STATE_PREFIX/spillover-cves.txt" .state/spillover-cves.txt
             fi
