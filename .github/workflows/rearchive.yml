@@ -13,7 +13,7 @@ on:
       max_cves:
         description: 'Max CVEs to process per run (the chain runs this about hourly)'
         required: false
-        default: '20'
+        default: '60'
         type: string
       annotate_max:
         description: 'Max ledger entries to back-fill date_published for, per run'
@@ -90,7 +90,7 @@ jobs:
       - name: Check what needs re-archiving
         id: check
         env:
-          MAX_CVES: ${{ inputs.max_cves || '20' }}
+          MAX_CVES: ${{ inputs.max_cves || '60' }}
           DRY_RUN: ${{ inputs.dry_run || 'false' }}
         run: |
           set -euo pipefail
@@ -131,7 +131,9 @@ jobs:
     if: needs.check-schedule.outputs.cves_due != '0' && inputs.dry_run != 'true'
     strategy:
       fail-fast: false
-      max-parallel: 5
+      # ~60 CVEs/hour keeps the ledger from growing (each fresh CVE owes four
+      # re-snapshots over 90 days); about 10% of the Team plan's 60-job cap.
+      max-parallel: 15
       matrix:
         cve_id: ${{ fromJSON(needs.check-schedule.outputs.cve_list) }}
     uses: ./.github/workflows/archive-cve.yml
