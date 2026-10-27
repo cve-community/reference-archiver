@@ -76,8 +76,10 @@ jobs:
             | .[].url
           ' 2>/dev/null || true)
 
-          # Count non-empty lines
-          REF_COUNT=$(printf '%s' "$URLS" | grep -c . 2>/dev/null || echo "0")
+          # Count non-empty lines. grep -c prints "0" *and* exits 1 on no
+          # match, so no `|| echo 0` here: that gave "0\n0", which broke the
+          # -eq test and GITHUB_OUTPUT for REJECTED CVEs (no references).
+          REF_COUNT=$(printf '%s' "$URLS" | grep -c . || true)
 
           # Empty reference guard: GHA treats fromJSON([]) as a workflow-level error.
           # Must check count here and skip matrix output if zero — cannot be caught downstream.
@@ -180,11 +182,26 @@ jobs:
             echo "::warning::No warc/ directory — SAVE_WGET/SAVE_WARC may not have produced WARC output"
           fi
 
-          # Verify all three outputs exist
+          # Verify the outputs exist. ArchiveBox skips its Chrome extractors
+          # (pdf, screenshot) for URLs it classes as static files by extension
+          # (.pdf, .json, .js, images, archives...; `is_static` in index.json),
+          # so for those the snapshot is wget's copy of the file plus the WARC.
           echo "Snapshot contents:" && ls -la "$SNAPSHOT_DIR" >&2
-          test -f "${SNAPSHOT_DIR}/output.pdf"      || { echo "::error::output.pdf not found" >&2; exit 1; }
-          test -f "${SNAPSHOT_DIR}/screenshot.png"  || { echo "::error::screenshot.png not found" >&2; exit 1; }
-          test -f "${SNAPSHOT_DIR}/warc.tgz"        || { echo "::error::warc.tgz not found" >&2; exit 1; }
+          test -f "${SNAPSHOT_DIR}/warc.tgz" || { echo "::error::warc.tgz not found" >&2; exit 1; }
+
+          IS_STATIC=$(jq -r '.is_static // false' "${SNAPSHOT_DIR}/index.json")
+          if [ "$IS_STATIC" = "true" ]; then
+            STATIC_FILE=$(jq -r '.latest.wget // empty' "${SNAPSHOT_DIR}/index.json")
+            if [ -z "$STATIC_FILE" ] || [ ! -f "${SNAPSHOT_DIR}/${STATIC_FILE}" ]; then
+              echo "::error::static-file reference but wget saved nothing (${STATIC_FILE:-no output})" >&2
+              exit 1
+            fi
+            echo "Static file: ${STATIC_FILE}"
+            echo "STATIC_FILE=${STATIC_FILE}" >> "$GITHUB_ENV"
+          else
+            test -f "${SNAPSHOT_DIR}/output.pdf"      || { echo "::error::output.pdf not found" >&2; exit 1; }
+            test -f "${SNAPSHOT_DIR}/screenshot.png"  || { echo "::error::screenshot.png not found" >&2; exit 1; }
+          fi
 
           echo "SNAPSHOT_DIR=${SNAPSHOT_DIR}" >> "$GITHUB_ENV"
 
@@ -225,12 +242,17 @@ jobs:
 
           echo "S3 prefix: s3://${S3_BUCKET}/${S3_PREFIX}" >&2
 
-          # Upload all three files
-          aws s3 cp "${SNAPSHOT_DIR}/output.pdf"     "s3://${S3_BUCKET}/${S3_PREFIX}/output.pdf"
-          aws s3 cp "${SNAPSHOT_DIR}/screenshot.png"  "s3://${S3_BUCKET}/${S3_PREFIX}/screenshot.png"
-          aws s3 cp "${SNAPSHOT_DIR}/warc.tgz"        "s3://${S3_BUCKET}/${S3_PREFIX}/warc.tgz"
-
-          echo "Uploaded 3 files to s3://${S3_BUCKET}/${S3_PREFIX}/" >&2
+          if [ -n "${STATIC_FILE:-}" ]; then
+            # Static-file reference (see the verify step): the file itself + WARC
+            aws s3 cp "${SNAPSHOT_DIR}/${STATIC_FILE}" "s3://${S3_BUCKET}/${S3_PREFIX}/$(basename "$STATIC_FILE")"
+            aws s3 cp "${SNAPSHOT_DIR}/warc.tgz"       "s3://${S3_BUCKET}/${S3_PREFIX}/warc.tgz"
+            echo "Uploaded $(basename "$STATIC_FILE") + warc.tgz to s3://${S3_BUCKET}/${S3_PREFIX}/" >&2
+          else
+            aws s3 cp "${SNAPSHOT_DIR}/output.pdf"     "s3://${S3_BUCKET}/${S3_PREFIX}/output.pdf"
+            aws s3 cp "${SNAPSHOT_DIR}/screenshot.png"  "s3://${S3_BUCKET}/${S3_PREFIX}/screenshot.png"
+            aws s3 cp "${SNAPSHOT_DIR}/warc.tgz"        "s3://${S3_BUCKET}/${S3_PREFIX}/warc.tgz"
+            echo "Uploaded 3 files to s3://${S3_BUCKET}/${S3_PREFIX}/" >&2
+          fi
 
   # Archive jobs upload straight to S3; this job rebuilds the per-CVE index from
   # the bucket and checks that the run actually delivered. (It used to hand the

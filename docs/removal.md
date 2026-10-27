@@ -12,6 +12,8 @@ Snapshot keys are derived from the reference URL:
 v2/<host>/<path>[__q__<url-encoded query>]/<YYYYMMDD-HHMMSS>/{output.pdf,screenshot.png,warc.tgz}
 ```
 
+A static-file reference (PDF, JSON, image...) holds the file under its own name plus `warc.tgz` instead.
+
 ```sh
 B=archiver-demo-v1-public
 P='v2/example.com/advisories/2025-001'          # URL → prefix, no trailing timestamp

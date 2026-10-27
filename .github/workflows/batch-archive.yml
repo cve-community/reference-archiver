@@ -42,7 +42,8 @@ jobs:
             | grep -E '^CVE-[0-9]{4}-[0-9]{4,}$' \
             || true)
 
-          CVE_COUNT=$(printf '%s' "$VALID_CVES" | grep -c . 2>/dev/null || echo "0")
+          # grep -c prints "0" and exits 1 on no match; `|| echo 0` would print twice
+          CVE_COUNT=$(printf '%s' "$VALID_CVES" | grep -c . || true)
 
           if [ "$CVE_COUNT" -eq 0 ]; then
             echo "::error::No valid CVE IDs found in input. Each line must match CVE-YYYY-NNNNN." >&2
