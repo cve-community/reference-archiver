@@ -32,11 +32,16 @@ jobs:
       matrix: ${{ steps.extract.outputs.matrix }}
       has_refs: ${{ steps.extract.outputs.has_refs }}
       ref_count: ${{ steps.extract.outputs.ref_count }}
+      # Snapshot folders are named by upload time, so anything stamped at or
+      # after this was produced by this run; collect uses it to verify delivery.
+      started: ${{ steps.extract.outputs.started }}
     steps:
       - name: Fetch and extract CVE references
         id: extract
         run: |
           set -euo pipefail
+
+          echo "started=$(date -u +%Y%m%d-%H%M%S)" >> "$GITHUB_OUTPUT"
 
           CVE_ID="${{ inputs.cve_id }}"
 
@@ -89,8 +94,8 @@ jobs:
           fi
 
           # Build fromJSON-compatible matrix: array of {index, url} objects.
-          # Index is embedded here (not derived from URL) to avoid artifact name collisions
-          # and because strategy.job-index is not reliably accessible inside matrix steps.
+          # Index is embedded here (not derived from URL) because strategy.job-index
+          # is not reliably accessible inside matrix steps.
           MATRIX=$(printf '%s' "$URLS" | jq -R -s '
             split("\n")
             | map(select(length > 0))
@@ -183,16 +188,6 @@ jobs:
 
           echo "SNAPSHOT_DIR=${SNAPSHOT_DIR}" >> "$GITHUB_ENV"
 
-      - name: Upload archive artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ inputs.cve_id }}-ref-${{ matrix.ref.index }}
-          path: |
-            ${{ env.SNAPSHOT_DIR }}/output.pdf
-            ${{ env.SNAPSHOT_DIR }}/screenshot.png
-            ${{ env.SNAPSHOT_DIR }}/warc.tgz
-          if-no-files-found: error
-
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -237,38 +232,16 @@ jobs:
 
           echo "Uploaded 3 files to s3://${S3_BUCKET}/${S3_PREFIX}/" >&2
 
+  # Archive jobs upload straight to S3; this job rebuilds the per-CVE index from
+  # the bucket and checks that the run actually delivered. (It used to hand the
+  # files over as artifacts, but download-artifact only lists the first 1,000
+  # artifacts of a run, so once runs grew to 250 CVEs every CVE past that point
+  # looked like a total failure.)
   collect:
     runs-on: ubuntu-latest
     needs: [prepare, archive]
     if: always()
     steps:
-      - name: Download all reference artifacts
-        uses: actions/download-artifact@v4
-        with:
-          pattern: ${{ inputs.cve_id }}-ref-*
-          merge-multiple: true
-          path: collected/
-
-      # Per-reference jobs are continue-on-error, so a systemic breakage (e.g.
-      # an ArchiveBox layout change) otherwise shows as green runs. Fail loudly
-      # when a CVE with references produced nothing at all.
-      - name: Fail if every reference failed
-        if: needs.prepare.outputs.has_refs == 'true'
-        run: |
-          if [ -z "$(find collected -type f 2>/dev/null | head -1)" ]; then
-            echo "::error::No reference archived for ${{ inputs.cve_id }}; all archive jobs failed"
-            FAILED=1
-          fi
-          echo "FAILED=${FAILED:-0}" >> "$GITHUB_ENV"
-
-      - name: Bundle into per-CVE artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: cve-${{ inputs.cve_id }}-archives
-          path: collected/
-          if-no-files-found: warn
-          retention-days: 90
-
       - name: Configure AWS credentials
         if: always()
         uses: aws-actions/configure-aws-credentials@v4
@@ -278,6 +251,8 @@ jobs:
 
       - name: Update CVE index in S3
         if: always()
+        env:
+          RUN_STARTED: ${{ needs.prepare.outputs.started }}
         run: |
           set -euo pipefail
 
@@ -291,6 +266,8 @@ jobs:
 
           cve_id = os.environ.get('CVE_ID', '${{ inputs.cve_id }}')
           bucket = os.environ.get('S3_BUCKET', 'archiver-demo-v1-public')
+          # Snapshot folders stamped at/after this were uploaded by this run
+          run_started = os.environ.get('RUN_STARTED', '')
 
           # Fetch the CVE JSON to get reference URLs
           m = re.match(r'CVE-(\d{4})-(\d+)', cve_id)
@@ -322,6 +299,7 @@ jobs:
               idx = {'cve_id': cve_id, 'snapshots': []}
 
           existing_prefixes = {s['s3_prefix'] for s in idx.get('snapshots', [])}
+          fresh_prefixes = set()
 
           for url in refs:
               try:
@@ -360,6 +338,9 @@ jobs:
                   prefix = '/'.join(key_parts[:-1])
                   timestamp = key_parts[-2]
 
+                  if run_started and timestamp >= run_started:
+                      fresh_prefixes.add(prefix)
+
                   if prefix in existing_prefixes or prefix in seen_prefixes:
                       continue
                   seen_prefixes.add(prefix)
@@ -383,30 +364,48 @@ jobs:
           idx['total_snapshots'] = len(idx['snapshots'])
 
           json.dump(idx, open('/tmp/cve_index_updated.json', 'w'), indent=2)
-          print(f"{len(idx['snapshots'])} total snapshots for {cve_id}")
+          print(f"{len(idx['snapshots'])} total snapshots for {cve_id}; {len(fresh_prefixes)} from this run")
 
+          with open('/tmp/collect_stats.json', 'w') as f:
+              json.dump({
+                  'refs': len(refs),
+                  'fresh_snapshots': len(fresh_prefixes),
+                  'total_snapshots': len(idx['snapshots']),
+              }, f)
           PYEOF
 
           aws s3 cp /tmp/cve_index_updated.json "s3://${S3_BUCKET}/${INDEX_KEY}" \
             --content-type application/json
 
+      # Per-reference jobs are continue-on-error, so a systemic breakage (e.g.
+      # an ArchiveBox layout change) otherwise shows as green runs. Fail loudly
+      # when a CVE with references produced nothing at all in this run.
+      - name: Fail if every reference failed
+        if: always() && needs.prepare.outputs.has_refs == 'true'
+        run: |
+          if [ ! -f /tmp/collect_stats.json ]; then
+            echo "::error::Could not verify snapshots for ${{ inputs.cve_id }}; the index step produced no stats"
+            FAILED=1
+          elif [ "$(jq -r '.fresh_snapshots // 0' /tmp/collect_stats.json)" = "0" ]; then
+            echo "::error::No reference archived for ${{ inputs.cve_id }}; all archive jobs failed"
+            FAILED=1
+          fi
+          echo "FAILED=${FAILED:-0}" >> "$GITHUB_ENV"
+
       - name: Write job summary
         if: always()
         run: |
           set -euo pipefail
-          mkdir -p collected/
-
-          # Count archive files (exclude metadata txt files)
-          ARCHIVE_FILES=$(find collected/ -type f \( -name '*.pdf' -o -name '*.png' -o -name '*.tgz' \) 2>/dev/null | wc -l | tr -d ' ')
-          SUCCESSFUL_ARCHIVES=$(( ARCHIVE_FILES / 3 ))
-
+          STATS=/tmp/collect_stats.json
+          [ -f "$STATS" ] || echo '{}' > "$STATS"
           {
             echo "### ${{ inputs.cve_id }}: Archive Run Complete"
             echo ""
             echo "| Metric | Count |"
             echo "|--------|-------|"
-            echo "| Archives succeeded | ${SUCCESSFUL_ARCHIVES} |"
-            echo "| Files collected | ${ARCHIVE_FILES} |"
+            echo "| References | $(jq -r '.refs // "?"' "$STATS") |"
+            echo "| Snapshots taken this run | $(jq -r '.fresh_snapshots // "?"' "$STATS") |"
+            echo "| Snapshots in S3 for this CVE | $(jq -r '.total_snapshots // "?"' "$STATS") |"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Report failure
