@@ -396,8 +396,15 @@ jobs:
               }, f)
           PYEOF
 
-          aws s3 cp /tmp/cve_index_updated.json "s3://${S3_BUCKET}/${INDEX_KEY}" \
-            --content-type application/json
+          # The index script exits early (no references, e.g. a REJECTED
+          # record, or the record could not be fetched) without writing a new
+          # index; nothing to upload then.
+          if [ -f /tmp/cve_index_updated.json ]; then
+            aws s3 cp /tmp/cve_index_updated.json "s3://${S3_BUCKET}/${INDEX_KEY}" \
+              --content-type application/json
+          else
+            echo "No index update for ${CVE_ID}" >&2
+          fi
 
       # Per-reference jobs are continue-on-error, so a systemic breakage (e.g.
       # an ArchiveBox layout change) otherwise shows as green runs. Fail loudly
