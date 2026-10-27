@@ -15,6 +15,11 @@ on:
         required: false
         default: '20'
         type: string
+      annotate_max:
+        description: 'Max ledger entries to back-fill date_published for, per run'
+        required: false
+        default: '20000'
+        type: string
 
 permissions:
   id-token: write
@@ -47,80 +52,78 @@ jobs:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Check what needs re-archiving
-        id: check
+      - name: Back-fill publication dates in the ledger
+        if: inputs.dry_run != 'true'
+        env:
+          ANNOTATE_MAX: ${{ inputs.annotate_max || '20000' }}
         run: |
           set -euo pipefail
 
-          MAX_CVES="${{ inputs.max_cves || '20' }}"
-          DRY_RUN="${{ inputs.dry_run || 'false' }}"
-
-          # Download schedule state (or start fresh)
           aws s3 cp "s3://${S3_BUCKET}/v2/schedule.json" /tmp/schedule.json 2>/dev/null \
             || echo '{"entries":[]}' > /tmp/schedule.json
 
-          # Find CVEs that need re-archiving based on intervals: 3, 10, 30, 90 days
-          python3 - <<'PYEOF'
-          import json, os, sys
-          from datetime import datetime, timedelta, timezone
+          # Entries registered before date_published was recorded, or whose lookup
+          # failed last time. At most ANNOTATE_MAX per run; the rest wait a cycle.
+          jq -r --argjson max "$ANNOTATE_MAX" \
+            '[.entries[] | select(.date_published == null) | .cve_id] | .[0:$max] | .[]' \
+            /tmp/schedule.json > /tmp/need_pub.txt
+          NEED=$(grep -c . /tmp/need_pub.txt || true)
+          if [ "$NEED" = "0" ]; then
+            echo "Every ledger entry carries date_published" >&2
+            exit 0
+          fi
 
-          INTERVALS = [3, 10, 30, 90]
-          max_cves = int(os.environ.get('MAX_CVES', '20'))
-          dry_run = os.environ.get('DRY_RUN', 'false') == 'true'
-          now = datetime.now(timezone.utc)
+          echo "Looking up datePublished for $NEED entries" >&2
+          scripts/cve-published-dates.sh < /tmp/need_pub.txt > /tmp/pub_dates.tsv
+          GOT=$(grep -c . /tmp/pub_dates.tsv || true)
+          echo "Resolved $GOT of $NEED" >&2
+          [ "$GOT" != "0" ] || exit 0
 
-          schedule = json.load(open('/tmp/schedule.json'))
-          entries = schedule.get('entries', [])
+          jq --rawfile tsv /tmp/pub_dates.tsv '
+            ($tsv | split("\n") | map(select(length > 0) | split("\t") | {key: .[0], value: .[1]}) | from_entries) as $pub
+            | .entries |= map(if .date_published == null and $pub[.cve_id] != null then .date_published = $pub[.cve_id] else . end)
+          ' /tmp/schedule.json > /tmp/schedule_annotated.json
+          aws s3 cp /tmp/schedule_annotated.json "s3://${S3_BUCKET}/v2/schedule.json" \
+            --content-type application/json
+          echo "::notice::Back-filled date_published for $GOT ledger entries ($((NEED - GOT)) unresolved)"
 
-          due_cves = set()
-          due_details = []
-
-          for entry in entries:
-              cve_id = entry['cve_id']
-              first_archived = datetime.fromisoformat(entry['first_archived'].replace('Z', '+00:00'))
-              completed_intervals = entry.get('completed_intervals', [])
-
-              for interval in INTERVALS:
-                  if interval in completed_intervals:
-                      continue
-                  due_date = first_archived + timedelta(days=interval)
-                  if now >= due_date:
-                      due_cves.add(cve_id)
-                      due_details.append({
-                          'cve_id': cve_id,
-                          'interval': interval,
-                          'due_since': due_date.isoformat(),
-                      })
-                      break  # Only the next due interval per CVE
-
-          # Cap at max
-          due_list = sorted(due_cves)[:max_cves]
-          due_count = len(due_list)
-
-          print(f"Due: {due_count} CVEs (of {len(due_cves)} total due)", file=sys.stderr)
-
-          # Write outputs
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-              f.write(f"cves_due={due_count}\n")
-              cve_json = json.dumps(due_list)
-              f.write(f"cve_list={cve_json}\n")
-
-          # Summary
-          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
-              f.write("### Re-archive Schedule Check\n\n")
-              f.write(f"| Metric | Value |\n|--------|-------|\n")
-              f.write(f"| Total entries tracked | {len(entries)} |\n")
-              f.write(f"| CVEs due for re-archive | {len(due_cves)} |\n")
-              f.write(f"| CVEs to process this run | {due_count} |\n")
-              f.write(f"| Dry run | {dry_run} |\n\n")
-              if due_details[:20]:
-                  f.write("**Due:**\n")
-                  for d in sorted(due_details, key=lambda x: x['due_since'])[:20]:
-                      f.write(f"- {d['cve_id']} (interval: {d['interval']}d, due since: {d['due_since'][:10]})\n")
-          PYEOF
+      - name: Check what needs re-archiving
+        id: check
         env:
-          MAX_CVES: ${{ inputs.max_cves || '10' }}
+          MAX_CVES: ${{ inputs.max_cves || '20' }}
           DRY_RUN: ${{ inputs.dry_run || 'false' }}
+        run: |
+          set -euo pipefail
+
+          aws s3 cp "s3://${S3_BUCKET}/v2/schedule.json" /tmp/schedule.json 2>/dev/null \
+            || echo '{"entries":[]}' > /tmp/schedule.json
+
+          # Intervals run from publication (PRD 2.4); see scripts/rearchive_schedule.py
+          python3 scripts/rearchive_schedule.py due --schedule /tmp/schedule.json --max "$MAX_CVES" > /tmp/due.json
+
+          DUE_COUNT=$(jq '.due | length' /tmp/due.json)
+          echo "Due: $DUE_COUNT CVEs (of $(jq .total_due /tmp/due.json) total due)" >&2
+
+          echo "cves_due=${DUE_COUNT}" >> "$GITHUB_OUTPUT"
+          echo "cve_list=$(jq -c .due /tmp/due.json)" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Re-archive Schedule Check"
+            echo ""
+            echo "| Metric | Value |"
+            echo "|--------|-------|"
+            echo "| Total entries tracked | $(jq .total_entries /tmp/due.json) |"
+            echo "| Entries with nothing left to re-archive | $(jq .nothing_left /tmp/due.json) |"
+            echo "| Entries missing date_published | $(jq .missing_date_published /tmp/due.json) |"
+            echo "| CVEs due for re-archive | $(jq .total_due /tmp/due.json) |"
+            echo "| CVEs to process this run | $DUE_COUNT |"
+            echo "| Dry run | $DRY_RUN |"
+            echo ""
+            if [ "$DUE_COUNT" != "0" ]; then
+              echo "**Due:**"
+              jq -r '.details[:20][] | "- \(.cve_id) (intervals: \(.intervals | join("/"))d, due since: \(.due_since[:10]))"' /tmp/due.json
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
   rearchive:
     name: Re-archive ${{ matrix.cve_id }}
@@ -142,6 +145,9 @@ jobs:
     if: always() && needs.check-schedule.outputs.cves_due != '0' && inputs.dry_run != 'true'
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -149,59 +155,20 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Mark completed intervals
+        env:
+          CVE_LIST: ${{ needs.check-schedule.outputs.cve_list }}
         run: |
           set -euo pipefail
-
-          CVE_LIST='${{ needs.check-schedule.outputs.cve_list }}'
 
           aws s3 cp "s3://${S3_BUCKET}/v2/schedule.json" /tmp/schedule.json 2>/dev/null \
             || echo '{"entries":[]}' > /tmp/schedule.json
 
-          python3 - <<'PYEOF'
-          import json, os
-          from datetime import datetime, timedelta, timezone
-
-          INTERVALS = [3, 10, 30, 90]
-          now = datetime.now(timezone.utc)
-          cve_list = json.loads(os.environ.get('CVE_LIST', '[]'))
-
-          schedule = json.load(open('/tmp/schedule.json'))
-          entries_by_cve = {e['cve_id']: e for e in schedule.get('entries', [])}
-
-          for cve_id in cve_list:
-              entry = entries_by_cve.get(cve_id)
-              if not entry:
-                  continue
-              first_archived = datetime.fromisoformat(entry['first_archived'].replace('Z', '+00:00'))
-              completed = set(entry.get('completed_intervals', []))
-
-              for interval in INTERVALS:
-                  if interval in completed:
-                      continue
-                  due_date = first_archived + timedelta(days=interval)
-                  if now >= due_date:
-                      completed.add(interval)
-                      break  # Only mark the one we just processed
-
-              entry['completed_intervals'] = sorted(completed)
-              entry['last_rearchived'] = now.strftime('%Y%m%d-%H%M%S')
-              entries_by_cve[cve_id] = entry
-
-          schedule['entries'] = sorted(entries_by_cve.values(), key=lambda e: e['cve_id'])
-          schedule['last_updated'] = now.strftime('%Y%m%d-%H%M%S')
-
-          json.dump(schedule, open('/tmp/schedule_updated.json', 'w'), indent=2)
-
-          # Count stats
-          total = len(schedule['entries'])
-          fully_done = sum(1 for e in schedule['entries'] if set(INTERVALS).issubset(set(e.get('completed_intervals', []))))
-          print(f"Schedule: {total} entries, {fully_done} fully completed")
-          PYEOF
+          # One catch-up snapshot covers every interval that was overdue.
+          python3 scripts/rearchive_schedule.py mark --schedule /tmp/schedule.json \
+            --cves "$CVE_LIST" --out /tmp/schedule_updated.json
 
           aws s3 cp /tmp/schedule_updated.json "s3://${S3_BUCKET}/v2/schedule.json" \
             --content-type application/json
-        env:
-          CVE_LIST: ${{ needs.check-schedule.outputs.cve_list }}
 
   # Second leg of the self-chaining loop (see crawl-cves.yml).
   chain:
