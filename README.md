@@ -26,7 +26,7 @@ This is the GitHub Actions implementation of the [AWG Reference Archive PRD](doc
 | Workflow            | Trigger                  | Purpose                                                |
 | ------------------- | ------------------------ | ------------------------------------------------------ |
 | `crawl-cves.yml`    | self-chained (see below) | Walk new cvelistV5 commits, archive up to 250 CVEs/run |
-| `rearchive.yml`     | ~hourly, from the chain  | Re-archive on the 3/10/30/90-day schedule              |
+| `rearchive.yml`     | ~hourly, from the chain  | Re-archive 3/10/30/90 days after publication           |
 | `site.yml`          | after archiving, site edits | Build site + stats from S3, deploy to GitHub Pages  |
 | `archive-cve.yml`   | manual / `workflow_call` | Archive all refs for one CVE                           |
 | `batch-archive.yml` | manual                   | Archive a list of CVEs                                 |
@@ -37,6 +37,8 @@ This is the GitHub Actions implementation of the [AWG Reference Archive PRD](doc
 The `schedule:` triggers are still in the files but rarely fire in this repo (it is a fork; GitHub mostly doesn't run schedules here). Instead each run's `chain` job dispatches the next one: crawl → crawl → …, with a rearchive leg whenever the last one started 55+ minutes ago. Set the repo variable `AUTO_CHAIN` to anything but `true` to stop the loop; `gh workflow run crawl-cves.yml` restarts it.
 
 Queues, in priority order: CVEs changed in new cvelistV5 commits and the spillover from earlier runs (one pool, newest CVE ID first), then `state/backfill-cves.txt` (gap fill, only with spare capacity). Anything queued in spillover is dropped from backfill so nothing is archived twice.
+
+Re-archive intervals (PRD 2.4) run from the record's `datePublished`, which the ledger stores per entry. An interval that had already passed when the first snapshot was taken is skipped, so a CVE archived long after publication gets exactly one snapshot; when several intervals are overdue at once, one catch-up snapshot covers them all. The logic lives in `scripts/rearchive_schedule.py`; `scripts/cve-published-dates.sh` looks dates up in cvelistV5.
 
 ## Storage
 
