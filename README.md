@@ -25,8 +25,8 @@ This is the GitHub Actions implementation of the [AWG Reference Archive PRD](doc
 
 | Workflow            | Trigger                  | Purpose                                                |
 | ------------------- | ------------------------ | ------------------------------------------------------ |
-| `crawl-cves.yml`    | self-chained (see below) | Walk new cvelistV5 commits, archive up to 100 CVEs/run |
-| `rearchive.yml`     | after each crawl         | Re-archive on the 3/10/30/90-day schedule              |
+| `crawl-cves.yml`    | self-chained (see below) | Walk new cvelistV5 commits, archive up to 250 CVEs/run |
+| `rearchive.yml`     | ~hourly, from the chain  | Re-archive on the 3/10/30/90-day schedule              |
 | `site.yml`          | after archiving, site edits | Build site + stats from S3, deploy to GitHub Pages  |
 | `archive-cve.yml`   | manual / `workflow_call` | Archive all refs for one CVE                           |
 | `batch-archive.yml` | manual                   | Archive a list of CVEs                                 |
@@ -34,7 +34,9 @@ This is the GitHub Actions implementation of the [AWG Reference Archive PRD](doc
 
 `crawl-cves` and `rearchive` share the `cve-archiving` concurrency group: they never overlap, so `schedule.json` has a single writer at a time.
 
-The `schedule:` triggers are still in the files but never fire in this repo (it is a fork; GitHub doesn't run schedules here). Instead each run's `chain` job dispatches the next one: crawl → rearchive → crawl. Set the repo variable `AUTO_CHAIN` to anything but `true` to stop the loop; `gh workflow run crawl-cves.yml` restarts it.
+The `schedule:` triggers are still in the files but rarely fire in this repo (it is a fork; GitHub mostly doesn't run schedules here). Instead each run's `chain` job dispatches the next one: crawl → crawl → …, with a rearchive leg whenever the last one started 55+ minutes ago. Set the repo variable `AUTO_CHAIN` to anything but `true` to stop the loop; `gh workflow run crawl-cves.yml` restarts it.
+
+Queues, in priority order: CVEs changed in new cvelistV5 commits and the spillover from earlier runs (one pool, newest CVE ID first), then `state/backfill-cves.txt` (gap fill, only with spare capacity). Anything queued in spillover is dropped from backfill so nothing is archived twice.
 
 ## Storage
 
@@ -44,9 +46,10 @@ s3://archiver-demo-v1-public/v2/
 ├── index/<CVE-ID>.json     # per-CVE reference list + snapshot prefixes
 ├── index.json              # global URL index (rebuilt from listing)
 ├── schedule.json           # re-archive ledger
-└── state/                  # crawl cursor + spillover queue
+└── state/                  # crawl cursor + queues
     ├── last-processed-sha
-    └── spillover-cves.txt
+    ├── spillover-cves.txt  # new/changed CVEs not yet archived, newest first
+    └── backfill-cves.txt   # low-priority gap fill (optional)
 ```
 
 The bucket is the only irreplaceable thing here. Protections:

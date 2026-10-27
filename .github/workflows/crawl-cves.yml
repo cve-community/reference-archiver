@@ -11,9 +11,9 @@ on:
         default: '100'
         type: string
       max_cves:
-        description: 'Max CVEs to archive per run (GHA 256 matrix limit)'
+        description: 'Max CVEs to archive per run (hard ceiling 256: GHA matrix limit)'
         required: false
-        default: '100'
+        default: '250'
         type: string
       dry_run:
         description: 'Dry run — log what would be archived but skip actual archival'
@@ -94,7 +94,7 @@ jobs:
           set -euo pipefail
 
           MAX_COMMITS="${{ inputs.max_commits || '100' }}"
-          MAX_CVES="${{ inputs.max_cves || '100' }}"
+          MAX_CVES="${{ inputs.max_cves || '250' }}"
           DRY_RUN="${{ inputs.dry_run || 'false' }}"
 
           # Count non-empty lines without the `grep -c || echo 0` double-print
@@ -174,13 +174,22 @@ jobs:
           head -n "$MAX_CVES" /tmp/all_unique.txt > /tmp/archive_now.txt
           tail -n +"$((MAX_CVES + 1))" /tmp/all_unique.txt > "$SPILLOVER_FILE"
 
-          # Fill any spare capacity from the backfill queue
+          # Backfill queue (low priority). Anything archived now, or waiting in
+          # spillover (which always drains before backfill), is dropped from it
+          # so no CVE is archived twice. Then spare capacity comes from the top.
           BACKFILL_FILE=".state/backfill-cves.txt"
+          if [ -s "$BACKFILL_FILE" ]; then
+            BEFORE=$(count_lines "$BACKFILL_FILE")
+            cat /tmp/archive_now.txt "$SPILLOVER_FILE" > /tmp/backfill_exclude.txt
+            grep -vxF -f /tmp/backfill_exclude.txt "$BACKFILL_FILE" > /tmp/backfill_rest.txt || true
+            mv /tmp/backfill_rest.txt "$BACKFILL_FILE"
+            echo "Backfill: dropped $((BEFORE - $(count_lines "$BACKFILL_FILE"))) CVEs already queued elsewhere" >&2
+          fi
           SPARE=$((MAX_CVES - $(count_lines /tmp/archive_now.txt)))
           if [ "$SPARE" -gt 0 ] && [ -s "$BACKFILL_FILE" ]; then
-            grep -vxF -f /tmp/archive_now.txt "$BACKFILL_FILE" > /tmp/backfill_rest.txt || true
-            head -n "$SPARE" /tmp/backfill_rest.txt >> /tmp/archive_now.txt
-            tail -n +"$((SPARE + 1))" /tmp/backfill_rest.txt > "$BACKFILL_FILE"
+            head -n "$SPARE" "$BACKFILL_FILE" >> /tmp/archive_now.txt
+            tail -n +"$((SPARE + 1))" "$BACKFILL_FILE" > /tmp/backfill_rest.txt
+            mv /tmp/backfill_rest.txt "$BACKFILL_FILE"
           fi
           echo "Backfill queue: $(count_lines "$BACKFILL_FILE") remaining" >&2
 
@@ -228,8 +237,10 @@ jobs:
     if: needs.crawl.outputs.cves_found != '0' && inputs.dry_run != 'true'
     strategy:
       fail-fast: false
-      # Free plan: 20 concurrent jobs per org; each CVE fans out per reference
-      max-parallel: 10
+      # Each CVE fans out into one job per reference. The org's concurrent-job
+      # cap (20 on Free, 60 on Team) is the real limit; this just keeps enough
+      # CVEs in flight to fill it through the serial prepare/collect phases.
+      max-parallel: 30
       matrix:
         cve_id: ${{ fromJSON(needs.crawl.outputs.cve_list) }}
     uses: ./.github/workflows/archive-cve.yml
@@ -401,10 +412,11 @@ jobs:
         env:
           CVE_LIST: ${{ needs.crawl.outputs.cve_list }}
 
-  # Scheduled triggers never fire in this repo (it is a fork; see MIGRATION.md),
-  # so the pipeline drives itself: crawl -> rearchive -> crawl -> ... Each leg
-  # dispatches the next. Kill switch: set the repo variable AUTO_CHAIN to
-  # anything but "true". Restart by hand: gh workflow run crawl-cves.yml
+  # Scheduled triggers rarely fire in this repo (it is a fork; see MIGRATION.md),
+  # so the pipeline drives itself: crawl -> crawl -> ..., with a rearchive leg
+  # about once an hour (its intended cadence). Each leg dispatches the next.
+  # Kill switch: set the repo variable AUTO_CHAIN to anything but "true".
+  # Restart by hand: gh workflow run crawl-cves.yml
   chain:
     name: Chain next run
     needs: [crawl, archive, update-index]
@@ -434,5 +446,16 @@ jobs:
         if: env.CVES_FOUND != '0' && env.CRAWL_RESULT == 'success'
         run: gh workflow run site.yml --ref main -R "$GITHUB_REPOSITORY"
 
-      - name: Dispatch rearchive
-        run: gh workflow run rearchive.yml --ref main -R "$GITHUB_REPOSITORY"
+      - name: Dispatch next leg
+        run: |
+          set -euo pipefail
+          LAST=$(gh run list --workflow rearchive.yml -R "$GITHUB_REPOSITORY" --limit 1 \
+            --json createdAt --jq '.[0].createdAt // "1970-01-01T00:00:00Z"')
+          AGE=$(( $(date +%s) - $(date -d "$LAST" +%s) ))
+          if [ "$AGE" -ge 3300 ]; then
+            echo "Last rearchive started ${AGE}s ago; running rearchive next"
+            gh workflow run rearchive.yml --ref main -R "$GITHUB_REPOSITORY"
+          else
+            echo "Rearchive ran ${AGE}s ago; going straight to the next crawl"
+            gh workflow run crawl-cves.yml --ref main -R "$GITHUB_REPOSITORY"
+          fi
