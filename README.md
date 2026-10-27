@@ -45,6 +45,7 @@ Re-archive intervals (PRD 2.4) run from the record's `datePublished`, which the 
 ```
 s3://archiver-demo-v1-public/v2/
 ├── <domain>/<path>[__q__<query>]/<YYYYMMDD-HHMMSS>/{output.pdf,screenshot.png,warc.tgz}
+│                           # static-file references (PDF, JSON, images...): {<the file>,warc.tgz}
 ├── index/<CVE-ID>.json     # per-CVE reference list + snapshot prefixes
 ├── index.json              # global URL index (rebuilt from listing)
 ├── schedule.json           # re-archive ledger

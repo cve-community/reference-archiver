@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 BUCKET = os.environ.get("S3_BUCKET", "archiver-demo-v1-public")
 OUTPUT = os.environ.get("STATS_OUTPUT", "docs/stats.html")
 TS_RE = re.compile(r"/(\d{8}-\d{6})/")
+SNAPSHOT_DIR_RE = re.compile(r"^\d{8}-\d{6}$")
 
 
 def aws(*args):
@@ -34,19 +35,26 @@ def load_schedule():
 
 
 def stream_s3_listing():
-    """Stream 'aws s3 ls --recursive' and yield screenshot.png keys."""
+    """Stream 'aws s3 ls --recursive' and yield one key per snapshot folder."""
     cmd = ["aws", "s3", "ls", f"s3://{BUCKET}/v2/", "--recursive"]
     env = os.environ.copy()
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True, env=env)
     count = 0
+    last_prefix = None
     for line in proc.stdout:
         # format: 2026-03-29 08:45:20     123456 v2/domain/path/timestamp/file
         parts = line.split(None, 3)
         if len(parts) != 4:
             continue
         key = parts[3].rstrip()
-        if not key.endswith("screenshot.png"):
+        # A snapshot is a <YYYYMMDD-HHMMSS>/ folder (page snapshots hold
+        # output.pdf + screenshot.png + warc.tgz, static-file references the
+        # file + warc.tgz). The listing is key-ordered, so a folder's files
+        # are consecutive: count the folder once, on its first file.
+        prefix = key.rpartition("/")[0]
+        if prefix == last_prefix or not SNAPSHOT_DIR_RE.match(prefix.rpartition("/")[2]):
             continue
+        last_prefix = prefix
         yield key
         count += 1
         if count % 2000 == 0:

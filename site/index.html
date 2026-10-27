@@ -277,22 +277,29 @@
     }
 
     async function routeSnapshot(s3Prefix) {
-      const files = ['output.pdf', 'screenshot.png', 'warc.tgz'];
-      const cards = h('div', { className: 'assets' });
-      files.forEach(f => {
-        const url = `${S3_BASE}/${s3Prefix}/${f}`;
-        const type = f.endsWith('.pdf') ? 'PDF' : f.endsWith('.png') ? 'Screenshot' : 'WARC Archive';
-        cards.appendChild(h('div', { className: 'asset-card' },
-          h('div', { className: 'type' }, type),
-          h('a', { href: url, target: '_blank', className: 'name' }, f),
-        ));
-      });
-
       // Parse prefix for breadcrumbs
       const parts = s3Prefix.split('/');
       const timestamp = parts[parts.length - 1];
       const urlParts = parts.slice(1, -1);
       const domain = urlParts[0];
+
+      // A page snapshot holds output.pdf + screenshot.png + warc.tgz; a
+      // static-file reference (PDF, JSON, image...) holds the file itself +
+      // warc.tgz. Use the real file list when the domain data has it.
+      let files = ['output.pdf', 'screenshot.png', 'warc.tgz'];
+      const data = await loadJSON(`domains/${encodeURIComponent(domain)}.json`);
+      const snap = data && data.urls.flatMap(u => u.snapshots).find(s => s.s3_prefix === s3Prefix);
+      if (snap && snap.files && snap.files.length) files = snap.files;
+
+      const TYPES = { 'output.pdf': 'PDF', 'screenshot.png': 'Screenshot', 'warc.tgz': 'WARC Archive' };
+      const cards = h('div', { className: 'assets' });
+      files.forEach(f => {
+        const url = `${S3_BASE}/${s3Prefix}/${f}`;
+        cards.appendChild(h('div', { className: 'asset-card' },
+          h('div', { className: 'type' }, TYPES[f] || 'Original file'),
+          h('a', { href: url, target: '_blank', className: 'name' }, f),
+        ));
+      });
 
       render(
         nav('domains'),

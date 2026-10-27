@@ -3,9 +3,12 @@
 
 import json
 import os
+import re
 import sys
 from collections import defaultdict
 from pathlib import Path
+
+SNAPSHOT_DIR_RE = re.compile(r'^\d{8}-\d{6}$')
 
 
 def parse_s3_listing(lines):
@@ -22,15 +25,17 @@ def parse_s3_listing(lines):
             continue
         key = parts[3]
 
-        # Only care about our 3 asset types
-        if not key.endswith(('output.pdf', 'screenshot.png', 'warc.tgz')):
-            continue
-
-        # Split key into prefix and filename
+        # Snapshot files sit directly under a <YYYYMMDD-HHMMSS>/ folder: page
+        # snapshots hold output.pdf, screenshot.png and warc.tgz; a static-file
+        # reference (PDF, JSON, image...) holds the file itself plus warc.tgz.
+        # Anything else (index/, state/, schedule.json) is skipped.
         key_parts = key.rsplit('/', 1)
-        if len(key_parts) == 2:
-            prefix, filename = key_parts
-            snapshots[prefix].add(filename)
+        if len(key_parts) != 2:
+            continue
+        prefix, filename = key_parts
+        if not SNAPSHOT_DIR_RE.match(prefix.rsplit('/', 1)[-1]):
+            continue
+        snapshots[prefix].add(filename)
 
     return snapshots
 
