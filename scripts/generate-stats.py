@@ -10,7 +10,7 @@ import re
 import subprocess
 import sys
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 BUCKET = os.environ.get("S3_BUCKET", "archiver-demo-v1-public")
 OUTPUT = os.environ.get("STATS_OUTPUT", "docs/stats.html")
@@ -77,6 +77,17 @@ def parse_date(key):
     return None
 
 
+def fill_days(days):
+    """Every calendar day from the first to the last, so a day with no
+    snapshots shows as a gap instead of disappearing from the axis."""
+    days = sorted(days)
+    if not days:
+        return []
+    start = datetime.strptime(days[0], "%Y-%m-%d")
+    span = (datetime.strptime(days[-1], "%Y-%m-%d") - start).days
+    return [(start + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(span + 1)]
+
+
 def main():
     entries = load_schedule()
 
@@ -95,16 +106,26 @@ def main():
 
     print("Streaming S3 listing ...", flush=True)
     domain_counts = defaultdict(int)
-    snapshots_per_day = defaultdict(int)
+    first_per_day = defaultdict(int)      # a URL's first snapshot
+    rearchive_per_day = defaultdict(int)  # every later snapshot of it
+    seen_urls = set()
 
     for key in stream_s3_listing():
         domain_counts[parse_domain(key)] += 1
         d = parse_date(key)
-        if d:
-            snapshots_per_day[d] += 1
+        if not d:
+            continue
+        # key = v2/<domain>/[path/]<timestamp>/<file>. The listing is sorted,
+        # so the first timestamp folder seen under a URL is its first capture.
+        url_prefix = key.rpartition("/")[0].rpartition("/")[0]
+        if url_prefix in seen_urls:
+            rearchive_per_day[d] += 1
+        else:
+            seen_urls.add(url_prefix)
+            first_per_day[d] += 1
 
-    snap_days = sorted(snapshots_per_day)
-    cve_days = sorted(cves_per_day)
+    snap_days = fill_days(set(first_per_day) | set(rearchive_per_day))
+    cve_days = fill_days(cves_per_day)
     top_domains = sorted(domain_counts.items(), key=lambda x: -x[1])[:25]
     years = sorted(cve_year_counts)
 
@@ -124,7 +145,9 @@ def main():
             "generated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         },
         "snap_days": snap_days,
-        "snap_vals": [snapshots_per_day[d] for d in snap_days],
+        "snap_vals": [first_per_day[d] + rearchive_per_day[d] for d in snap_days],
+        "snap_first": [first_per_day[d] for d in snap_days],
+        "snap_re": [rearchive_per_day[d] for d in snap_days],
         "cve_days": cve_days,
         "cve_vals": [cves_per_day[d] for d in cve_days],
         "domain_labels": [x[0] for x in top_domains],
@@ -174,6 +197,13 @@ def write_html(d):
   .chart-card h2 {{ font-size: .8rem; color: var(--muted); margin-bottom: 1.25rem;
                     text-transform: uppercase; letter-spacing: .06em; }}
   .chart-card.wide {{ grid-column: 1 / -1; }}
+  .chart-card .head {{ display: flex; align-items: baseline; justify-content: space-between;
+                       gap: 1rem; margin-bottom: 1.25rem; }}
+  .chart-card .head h2 {{ margin-bottom: 0; }}
+  .scale {{ display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }}
+  .scale button {{ background: none; border: 0; color: var(--muted); font: inherit; font-size: .7rem;
+                   text-transform: uppercase; letter-spacing: .06em; padding: .3rem .7rem; cursor: pointer; }}
+  .scale button.on {{ background: var(--border); color: var(--text); }}
   canvas {{ max-height: 300px; }}
 </style>
 </head>
@@ -191,12 +221,18 @@ def write_html(d):
 <div class="grid">
 
   <div class="chart-card wide">
-    <h2>Snapshots archived per day</h2>
+    <div class="head"><h2>Snapshots archived per day</h2>
+      <div class="scale" data-for="snapTimeline">
+        <button data-scale="logarithmic" class="on">Log</button><button data-scale="linear">Linear</button>
+      </div></div>
     <canvas id="snapTimeline"></canvas>
   </div>
 
   <div class="chart-card wide">
-    <h2>New CVEs added per day</h2>
+    <div class="head"><h2>New CVEs added per day</h2>
+      <div class="scale" data-for="cveTimeline">
+        <button data-scale="logarithmic" class="on">Log</button><button data-scale="linear">Linear</button>
+      </div></div>
     <canvas id="cveTimeline"></canvas>
   </div>
 
@@ -223,31 +259,36 @@ const TICK = {{ color: "#8892a4", font: {{ size: 11 }} }};
 const TIP  = {{ backgroundColor: "#1a1d27", borderColor: "#2a2d3a", borderWidth: 1,
                 titleColor: "#e2e8f0", bodyColor: "#8892a4" }};
 
-new Chart(document.getElementById("snapTimeline"), {{
-  type: "bar",
-  data: {{
-    labels: DATA.snap_days,
-    datasets: [{{ label: "Snapshots", data: DATA.snap_vals,
-      backgroundColor: "rgba(99,102,241,.75)", borderRadius: 2, borderSkipped: false }}]
-  }},
-  options: {{ responsive: true,
-    plugins: {{ legend: {{ display: false }}, tooltip: TIP }},
-    scales: {{ x: {{ grid: GRID, ticks: {{ ...TICK, maxTicksLimit: 14 }} }}, y: {{ grid: GRID, ticks: TICK }} }}
-  }}
-}});
+const fmt = n => n.toLocaleString("en-US");
 
-new Chart(document.getElementById("cveTimeline"), {{
-  type: "bar",
-  data: {{
-    labels: DATA.cve_days,
-    datasets: [{{ label: "CVEs", data: DATA.cve_vals,
-      backgroundColor: "rgba(34,211,238,.75)", borderRadius: 2, borderSkipped: false }}]
-  }},
-  options: {{ responsive: true,
-    plugins: {{ legend: {{ display: false }}, tooltip: TIP }},
-    scales: {{ x: {{ grid: GRID, ticks: {{ ...TICK, maxTicksLimit: 14 }} }}, y: {{ grid: GRID, ticks: TICK }} }}
-  }}
-}});
+// Daily bars span three orders of magnitude (a few hundred a day for months,
+// then tens of thousands during a catch-up), so the timelines default to a
+// log axis; the toggle switches to linear. Zero days are gaps on both.
+function timeline(id, labels, values, color, lines) {{
+  const chart = new Chart(document.getElementById(id), {{
+    type: "bar",
+    data: {{ labels, datasets: [{{ data: values, backgroundColor: color, borderRadius: 2, borderSkipped: false }}] }},
+    options: {{ responsive: true,
+      interaction: {{ mode: "index", intersect: false }},
+      plugins: {{ legend: {{ display: false }},
+                  tooltip: {{ ...TIP, callbacks: {{ label: ctx => lines(ctx.dataIndex) }} }} }},
+      scales: {{ x: {{ grid: GRID, ticks: {{ ...TICK, maxTicksLimit: 14 }} }},
+                 y: {{ type: "logarithmic", grid: GRID, ticks: TICK }} }}
+    }}
+  }});
+  document.querySelectorAll('.scale[data-for="' + id + '"] button').forEach(b => b.addEventListener("click", () => {{
+    chart.options.scales.y.type = b.dataset.scale;
+    chart.update();
+    b.parentNode.querySelectorAll("button").forEach(x => x.classList.toggle("on", x === b));
+  }}));
+}}
+
+timeline("snapTimeline", DATA.snap_days, DATA.snap_vals, "rgba(99,102,241,.75)", i => [
+  fmt(DATA.snap_vals[i]) + " snapshots",
+  "  " + fmt(DATA.snap_first[i]) + " first captures",
+  "  " + fmt(DATA.snap_re[i]) + " re-archives" ]);
+
+timeline("cveTimeline", DATA.cve_days, DATA.cve_vals, "rgba(34,211,238,.75)", i => fmt(DATA.cve_vals[i]) + " CVEs");
 
 new Chart(document.getElementById("domains"), {{
   type: "bar",
