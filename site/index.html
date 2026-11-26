@@ -56,6 +56,24 @@
     .pagination { display: flex; justify-content: center; gap: 8px; margin-top: 16px; }
     .pagination a { padding: 4px 12px; border-radius: 4px; background: #21262d; font-size: 13px; }
     .pagination a.active { background: #1f6feb; color: #fff; }
+    .pilot-strip { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; padding: 10px 14px; margin: -8px 0 24px; background: #161b22; border: 1px solid #21262d; border-left: 3px solid #1f6feb; border-radius: 6px; font-size: 13px; }
+    .pilot-strip .pill { font-size: 11px; font-weight: 600; letter-spacing: 1px; text-transform: uppercase; color: #58a6ff; border: 1px solid #1f6feb; border-radius: 999px; padding: 1px 8px; white-space: nowrap; }
+    .pilot-strip .links { margin-left: auto; display: flex; gap: 14px; white-space: nowrap; }
+
+    .pilot { border: 1px solid #21262d; border-radius: 6px; padding: 20px 24px; margin-bottom: 24px; background: #161b22; }
+    .pilot h2 { font-size: 18px; color: #f0f6fc; margin-bottom: 8px; }
+    .pilot p { font-size: 14px; max-width: 72ch; }
+    .cta { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
+    .cta a { display: inline-block; padding: 6px 14px; border-radius: 6px; background: #1f6feb; color: #fff; font-size: 13px; font-weight: 500; }
+    .cta a.secondary { background: #21262d; color: #c9d1d9; }
+    .cta a:hover { text-decoration: none; filter: brightness(1.15); }
+
+    .about { max-width: 72ch; }
+    .about h2 { font-size: 18px; color: #f0f6fc; margin: 28px 0 8px; }
+    .about h2:first-child { margin-top: 0; }
+    .about p, .about li { font-size: 14px; margin-bottom: 10px; }
+    .about ul { padding-left: 20px; }
+    .about code { background: #21262d; padding: 1px 5px; border-radius: 4px; font-size: 13px; }
   </style>
 </head>
 <body>
@@ -64,6 +82,11 @@
       <h1>CVE Reference Archive</h1>
       <p>Archived snapshots of CVE reference URLs — PDF, screenshot, and WARC</p>
     </header>
+    <div class="pilot-strip">
+      <span class="pill">Official pilot</span>
+      <span>cvearchiver.com is part of the CVE Program's Reference Archive pilot, open for community feedback through January 2027.</span>
+      <span class="links"><a href="https://www.cve.org/Media/News/item/blog/2026/11/03/CVE-Program-Reference-Archive-Pilot" target="_blank" rel="noopener">Announcement</a><a href="https://github.com/cve-community/reference-archiver/issues" target="_blank" rel="noopener">Give feedback</a><a href="#/about">About the pilot</a></span>
+    </div>
     <div id="app"><div class="loading">Loading...</div></div>
   </div>
 
@@ -71,6 +94,9 @@
     const S3_BASE = 'https://archive.cvearchiver.com';
     const DATA_BASE = './data';
     const PER_PAGE = 30;
+    const REPO = 'https://github.com/cve-community/reference-archiver';
+    const ISSUES = `${REPO}/issues`;
+    const PILOT_BLOG = 'https://www.cve.org/Media/News/item/blog/2026/11/03/CVE-Program-Reference-Archive-Pilot';
 
     let manifest = null;
 
@@ -114,6 +140,7 @@
         h('a', { href: '#/', className: active === 'domains' ? 'active' : '' }, 'By Domain'),
         h('a', { href: '#/cves', className: active === 'cves' ? 'active' : '' }, 'By CVE'),
         h('a', { href: 'stats.html' }, 'Stats'),
+        h('a', { href: '#/about', className: active === 'about' ? 'active' : '' }, 'About the pilot'),
       );
     }
 
@@ -205,6 +232,47 @@
       return list;
     }
 
+    // ---- PILOT ----
+
+    function extLink(href, text, cls) {
+      return h('a', { href, target: '_blank', rel: 'noopener', className: cls || '' }, text);
+    }
+
+    function pilotCard() {
+      return h('div', { className: 'pilot' },
+        h('h2', null, 'Help the CVE Program evaluate this archive'),
+        h('p', null, 'This site is being reviewed as part of an official CVE Program pilot that runs through January 2027. Vulnerability coordinators, tool developers, researchers, and downstream consumers are invited to test it and report what works, what breaks, and what is missing.'),
+        h('div', { className: 'cta' },
+          extLink(ISSUES, 'Give feedback on GitHub'),
+          extLink(PILOT_BLOG, 'Read the announcement', 'secondary'),
+          h('a', { href: '#/about', className: 'secondary' }, 'About the pilot'),
+        ),
+      );
+    }
+
+    function routeAbout() {
+      render(
+        nav('about'),
+        h('div', { className: 'about' },
+          h('h2', null, 'About the pilot'),
+          h('p', null, 'The CVE Reference Archive (cvearchiver.com) preserves permanent, point-in-time snapshots of CVE reference URLs, saving vendor advisories, bulletins, and patches as PDFs, full-page screenshots, and WARC files so critical vulnerability context is not lost to broken links or silent modifications.'),
+          h('p', null, 'The site and the technology behind it are being reviewed as part of an official pilot run by the CVE Program through January 2027. The goal of the pilot is to review the platform and gather community feedback as the Program evaluates it for official adoption. ',
+            extLink(PILOT_BLOG, 'Read the CVE Program announcement'), '.'),
+          h('h2', null, 'How to participate'),
+          h('p', null, 'Vulnerability coordinators, tool developers, researchers, and downstream consumers are invited to review and test cvearchiver.com and to submit thoughts, bug reports, or feature requests, including feedback on load performance, snapshot formats, and desired integrations, through the CVE Program Reference Archive issue tracker on GitHub.'),
+          h('div', { className: 'cta' }, extLink(ISSUES, 'Give feedback on GitHub')),
+          h('h2', null, 'What is running here'),
+          h('ul', null,
+            h('li', null, 'A GitHub Actions pipeline watches ', extLink('https://github.com/CVEProject/cvelistV5', 'CVEProject/cvelistV5'),
+              ' for new and updated CVE records and archives every reference URL with ArchiveBox, then re-archives it 3, 10, 30 and 90 days after publication.'),
+            h('li', null, 'Snapshots are stored append-only in S3 and served from archive.cvearchiver.com. Each CVE has a machine-readable index at ',
+              h('code', null, 'archive.cvearchiver.com/v2/index/<CVE-ID>.json'), '.'),
+            h('li', null, 'Everything is open source in ', extLink(REPO, 'cve-community/reference-archiver'), '. The README describes the workflows behind this site.'),
+          ),
+        ),
+      );
+    }
+
     // ---- ROUTES ----
 
     async function routeHome() {
@@ -218,6 +286,7 @@
       }));
       render(
         nav('domains'),
+        pilotCard(),
         h('div', { className: 'stats' },
           h('div', { className: 'stat' }, h('div', { className: 'num' }, String(m.total_domains)), h('div', { className: 'label' }, 'Domains')),
           h('div', { className: 'stat' }, h('div', { className: 'num' }, String(m.total_urls)), h('div', { className: 'label' }, 'URLs')),
@@ -396,6 +465,7 @@
       try {
         if (path === '/' || path === '') return routeHome();
         if (path === '/cves') return routeCves();
+        if (path === '/about') return routeAbout();
 
         let m;
         if (m = path.match(/^\/domain\/(.+)$/)) return routeDomain(decodeURIComponent(m[1]));

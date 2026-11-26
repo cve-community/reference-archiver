@@ -16,6 +16,8 @@ BUCKET = os.environ.get("S3_BUCKET", "archiver-demo-v1-public")
 OUTPUT = os.environ.get("STATS_OUTPUT", "docs/stats.html")
 TS_RE = re.compile(r"/(\d{8}-\d{6})/")
 SNAPSHOT_DIR_RE = re.compile(r"^\d{8}-\d{6}$")
+PILOT_BLOG = "https://www.cve.org/Media/News/item/blog/2026/11/03/CVE-Program-Reference-Archive-Pilot"
+ISSUES_URL = "https://github.com/cve-community/reference-archiver/issues"
 
 
 def aws(*args):
@@ -205,11 +207,25 @@ def write_html(d):
                    text-transform: uppercase; letter-spacing: .06em; padding: .3rem .7rem; cursor: pointer; }}
   .scale button.on {{ background: var(--border); color: var(--text); }}
   canvas {{ max-height: 300px; }}
+  .pilot-strip {{ display: flex; flex-wrap: wrap; align-items: center; gap: .5rem .9rem; padding: .6rem .9rem;
+                  margin: -1rem 0 2rem; background: var(--surface); border: 1px solid var(--border);
+                  border-left: 3px solid var(--c1); border-radius: 8px; font-size: .85rem; }}
+  .pilot-strip .pill {{ font-size: .65rem; font-weight: 600; letter-spacing: .08em; text-transform: uppercase;
+                        color: var(--c2); border: 1px solid var(--c2); border-radius: 999px; padding: 0 .5rem;
+                        white-space: nowrap; }}
+  .pilot-strip .links {{ margin-left: auto; display: flex; gap: .9rem; white-space: nowrap; }}
+  .pilot-strip a {{ color: var(--c2); text-decoration: none; }}
 </style>
 </head>
 <body>
 <h1>CVE Reference Archive — Stats</h1>
 <p class="meta">Generated {t["generated"]} &nbsp;·&nbsp; <a href="/">← Archive</a></p>
+
+<div class="pilot-strip">
+  <span class="pill">Official pilot</span>
+  <span>cvearchiver.com is part of the CVE Program's Reference Archive pilot, open for community feedback through January 2027.</span>
+  <span class="links"><a href="{PILOT_BLOG}" target="_blank" rel="noopener">Announcement</a><a href="{ISSUES_URL}" target="_blank" rel="noopener">Give feedback</a><a href="/#/about">About the pilot</a></span>
+</div>
 
 <div class="stats-row">
   <div class="stat-card"><div class="n">{t["cves"]:,}</div><div class="l">CVEs</div></div>
